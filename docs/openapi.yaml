@@ -1,0 +1,828 @@
+﻿openapi: 3.1.0
+jsonSchemaDialect: https://spec.openapis.org/oas/3.1/dialect/base
+info:
+  title: Markdown and EPUB Translator Backend API
+  version: 1.5.0
+  description: |
+    Backend-only API for Markdown and EPUB translation workflows.
+    It supports Markdown text upload, EPUB archive upload, parsing,
+    task status polling, block-level translation and retranslation,
+    annotations, and Markdown/PDF/EPUB export.
+servers:
+  - url: http://localhost:8787
+    description: Local development
+tags:
+  - name: System
+  - name: Settings
+  - name: Tasks
+  - name: Blocks
+  - name: Annotations
+  - name: Exports
+paths:
+  /:
+    get:
+      tags: [System]
+      summary: Get service root overview
+      responses:
+        '200':
+          description: Service overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RootOverviewEnvelope'
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+  /api:
+    get:
+      tags: [System]
+      summary: Get API overview
+      responses:
+        '200':
+          description: API overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceOverviewEnvelope'
+  /api/docs:
+    get:
+      tags: [System]
+      summary: Get machine-readable JSON docs
+      responses:
+        '200':
+          description: JSON API docs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+  /openapi.yaml:
+    get:
+      tags: [System]
+      summary: Download OpenAPI YAML
+      responses:
+        '200':
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /api/openapi.yaml:
+    get:
+      tags: [System]
+      summary: Download OpenAPI YAML from alias route
+      responses:
+        '200':
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /api/settings:
+    get:
+      tags: [Settings]
+      summary: Get backend settings
+      responses:
+        '200':
+          description: Current settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+    put:
+      tags: [Settings]
+      summary: Update backend settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsUpdateRequest'
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/settings/api-key/dotenv:
+    post:
+      tags: [Settings]
+      summary: Persist apiKey into the local .env file
+      description: Writes MARKDOWN_TRANSLATOR_API_KEY into the local .env file. Restricted to loopback requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [apiKey]
+              properties:
+                apiKey:
+                  type: string
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '501':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/settings/api-key:
+    delete:
+      tags: [Settings]
+      summary: Clear session and/or .env apiKey
+      description: Restricted to loopback requests.
+      parameters:
+        - in: query
+          name: scope
+          schema:
+            type: string
+            enum: [session, dotenv, all]
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '501':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks:
+    get:
+      tags: [Tasks]
+      summary: List tasks
+      responses:
+        '200':
+          description: Task list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskListEnvelope'
+    post:
+      tags: [Tasks]
+      summary: Create a Markdown or EPUB task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Created task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks/{taskId}:
+    get:
+      tags: [Tasks]
+      summary: Get full task detail
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      tags: [Tasks]
+      summary: Delete one task
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteTaskEnvelope'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks/{taskId}/parse:
+    post:
+      tags: [Tasks]
+      summary: Reparse an existing task using the same format
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReparseTaskRequest'
+      responses:
+        '200':
+          description: Reparsed task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks/{taskId}/status:
+    get:
+      tags: [Tasks]
+      summary: Get task status and live metrics
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskStatusEnvelope'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks/{taskId}/translate:
+    post:
+      tags: [Tasks]
+      summary: Start full-document translation
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tasks/{taskId}/pause:
+    post:
+      tags: [Tasks]
+      summary: Pause queued or active blocks
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/resume:
+    post:
+      tags: [Tasks]
+      summary: Resume paused blocks
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/cancel:
+    post:
+      tags: [Tasks]
+      summary: Cancel queued, paused, or active blocks
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/blocks/{blockId}:
+    get:
+      tags: [Blocks]
+      summary: Get one block
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BlockId'
+      responses:
+        '200':
+          description: Block detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlockDetailEnvelope'
+    patch:
+      tags: [Blocks]
+      summary: Update translated content or lock state for one block
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BlockId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBlockRequest'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'  /api/tasks/{taskId}/blocks/{blockId}/prompt:
+    get:
+      tags: [Blocks]
+      summary: Get prompt snapshot for one block
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BlockId'
+      responses:
+        '200':
+          description: Prompt snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlockPromptEnvelope'
+  /api/tasks/{taskId}/blocks/{blockId}/translate:
+    post:
+      tags: [Blocks]
+      summary: Start translation for one block
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BlockId'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/blocks/{blockId}/retranslate:
+    post:
+      tags: [Blocks]
+      summary: Start retranslation for one block
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BlockId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetranslateBlockRequest'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/blocks/retranslate-batch:
+    post:
+      tags: [Blocks]
+      summary: Start retranslation for multiple blocks
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRetranslateRequest'
+      responses:
+        '200':
+          description: Batch scheduling result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+  /api/tasks/{taskId}/annotations:
+    post:
+      tags: [Annotations]
+      summary: Save one annotation
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnotationRequest'
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEnvelope'
+  /api/tasks/{taskId}/exports/{format}:
+    get:
+      tags: [Exports]
+      summary: Export task artifacts
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/ExportFormat'
+        - $ref: '#/components/parameters/ExportLayout'
+        - $ref: '#/components/parameters/DownloadRaw'
+      responses:
+        '200':
+          description: Export artifact or raw download
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportEnvelope'
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/epub+zip:
+              schema:
+                type: string
+                format: binary
+components:
+  parameters:
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BlockId:
+      name: blockId
+      in: path
+      required: true
+      schema:
+        type: string
+    ExportFormat:
+      name: format
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [markdown, markdown_bilingual, records, annotations, mapping, pdf, pdf_bilingual, epub]
+    ExportLayout:
+      name: layout
+      in: query
+      schema:
+        type: string
+        enum: [translation-only, bilingual]
+        default: translation-only
+    DownloadRaw:
+      name: download
+      in: query
+      schema:
+        type: boolean
+        default: false
+  responses:
+    ErrorResponse:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [success, data, error]
+      properties:
+        success: { type: boolean, const: true }
+        data: {}
+        error: { type: 'null' }
+    ErrorEnvelope:
+      type: object
+      required: [success, data, error]
+      properties:
+        success: { type: boolean, const: false }
+        data: { type: 'null' }
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details:
+              oneOf:
+                - type: object
+                  additionalProperties: true
+                - type: 'null'
+    ServiceInfo:
+      type: object
+      additionalProperties: true
+    ServiceOverview:
+      type: object
+      additionalProperties: true
+    RootOverviewEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    ServiceOverviewEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    HealthEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    SettingsView:
+      type: object
+      additionalProperties: true
+    SettingsUpdateRequest:
+      type: object
+      additionalProperties: true
+    ParserInfo:
+      type: object
+      additionalProperties: true
+    TaskStats:
+      type: object
+      additionalProperties: true
+    SourceRange:
+      type: object
+      additionalProperties: true
+      properties:
+        startLine: { type: integer, minimum: 0 }
+        endLine: { type: integer, minimum: 0 }
+        startOffset: { type: integer, minimum: 0 }
+        endOffset: { type: integer, minimum: 0 }
+        documentPath: { type: string }
+        nodePath: { type: string }
+    TranslationUnit:
+      type: object
+      additionalProperties: true
+      properties:
+        mode: { type: string }
+        chapterPath: { type: string }
+        chapterIndex: { type: integer, minimum: 0 }
+        nodePath: { type: string }
+        sourceFragment: { type: string }
+        translatedFragment: { type: string }
+        structureSignature: { type: string }
+        rootTag: { type: string }
+    AssetSummary:
+      type: object
+      additionalProperties: true
+      properties:
+        packagePath: { type: string }
+        title: { type: string }
+        language: { type: string }
+        spineCount: { type: integer, minimum: 0 }
+    PromptSnapshot:
+      type: object
+      additionalProperties: true
+    Annotation:
+      type: object
+      additionalProperties: true
+    ActivityItem:
+      type: object
+      additionalProperties: true
+    Block:
+      type: object
+      additionalProperties: true
+      required: [id, type, status, sourceMarkdown, translatedMarkdown]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        status: { type: string }
+        sourceMarkdown: { type: string }
+        translatedMarkdown: { type: string }
+        shouldTranslate: { type: boolean }
+        locked: { type: boolean }
+        sourceRange:
+          $ref: '#/components/schemas/SourceRange'
+        translationUnit:
+          oneOf:
+            - $ref: '#/components/schemas/TranslationUnit'
+            - type: 'null'
+    TaskSummary:
+      type: object
+      additionalProperties: true
+    Task:
+      type: object
+      additionalProperties: true
+      required: [id, filename, documentFormat, sourceMarkdown, parser, stats, blocks, summary]
+      properties:
+        id: { type: string, format: uuid }
+        filename: { type: string }
+        documentFormat: { type: string, enum: [markdown, epub] }
+        sourceMarkdown: { type: string }
+        parser:
+          $ref: '#/components/schemas/ParserInfo'
+        stats:
+          $ref: '#/components/schemas/TaskStats'
+        blocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Block'
+        summary:
+          $ref: '#/components/schemas/TaskSummary'
+        asset:
+          oneOf:
+            - $ref: '#/components/schemas/AssetSummary'
+            - type: 'null'
+    TaskListItem:
+      type: object
+      additionalProperties: true
+      required: [id, filename, documentFormat]
+      properties:
+        id: { type: string, format: uuid }
+        filename: { type: string }
+        documentFormat: { type: string, enum: [markdown, epub] }
+    TaskStatus:
+      type: object
+      additionalProperties: true
+      required: [taskId, filename, documentFormat, stage, summary, blocks]
+      properties:
+        taskId: { type: string, format: uuid }
+        filename: { type: string }
+        documentFormat: { type: string, enum: [markdown, epub] }
+        stage: { type: string }
+        summary:
+          $ref: '#/components/schemas/TaskSummary'
+        blocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Block'
+    ExportArtifact:
+      type: object
+      additionalProperties: true
+      required: [filename, mimeType, encoding, content]
+      properties:
+        filename: { type: string }
+        mimeType: { type: string }
+        encoding: { type: string }
+        content:
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items: {}
+    TaskEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/Task'
+    TaskListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/TaskListItem'
+    TaskStatusEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/TaskStatus'
+    SettingsEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/SettingsView'
+    BlockDetailEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    BlockPromptEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    DeleteTaskEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    ExportEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              additionalProperties: true
+    CreateTaskRequest:
+      type: object
+      required: [filename]
+      additionalProperties: false
+      properties:
+        filename: { type: string }
+        documentFormat: { type: string, enum: [markdown, epub], default: markdown }
+        content:
+          type: string
+          description: Required for Markdown tasks.
+        contentBase64:
+          type: string
+          description: Required for EPUB tasks. Base64-encoded EPUB archive bytes.
+        config:
+          $ref: '#/components/schemas/SettingsUpdateRequest'
+    ReparseTaskRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        filename: { type: string }
+        documentFormat: { type: string, enum: [markdown, epub] }
+        content: { type: string }
+        contentBase64: { type: string }
+        config:
+          $ref: '#/components/schemas/SettingsUpdateRequest'
+    RetranslateBlockRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        retranslationGoal: { type: string }
+        focus: { type: string }
+    BatchRetranslateRequest:
+      type: object
+      required: [blockIds]
+      additionalProperties: false
+      properties:
+        blockIds:
+          type: array
+          items: { type: string }
+        retranslationGoal: { type: string }
+        focus: { type: string }
+    UpdateBlockRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        translatedMarkdown: { type: string }
+        locked: { type: boolean }
+    AnnotationInput:
+      type: object
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [highlight, underline, strike, comment] }
+        scope: { type: string }
+        start: { type: integer, minimum: 0 }
+        end: { type: integer, minimum: 0 }
+        text: { type: string }
+        note: { type: string }
+    AnnotationRequest:
+      type: object
+      required: [blockId, annotation]
+      additionalProperties: false
+      properties:
+        blockId: { type: string }
+        annotation:
+          $ref: '#/components/schemas/AnnotationInput'

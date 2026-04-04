@@ -1,0 +1,4 @@
+interface:
+  display_name: "Markdown DeepSeek Translator"
+  short_description: "Translate Markdown blocks with safe DeepSeek prompts."
+  default_prompt: "Use $markdown-deepseek-translator to translate Markdown into Chinese with block-level prompts and structure-safe retries."
