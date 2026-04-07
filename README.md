@@ -1,98 +1,610 @@
-﻿# Markdown Translator Backend
+# Translate Book
 
-This repository exposes a REST backend for Markdown and EPUB translation workflows.
+一个面向长文档的 Markdown / EPUB 翻译工具，包含：
 
-Supported capabilities:
+- 后端任务引擎
+- Web 管理界面
+- 块级翻译、重试、导出
+- EPUB 解析、结构保持与回写导出
 
-- AST-backed Markdown parsing with `remark + unified + mdast`
-- EPUB archive parsing through OPF/spine/XHTML traversal
-- Live DeepSeek-compatible block translation
-- Batch retranslation and task control
-- Block annotations and task polling
-- Markdown / PDF / EPUB export
+项目适合以下场景：
 
-## Parser stack
+- 把英文技术书、研究资料、课程讲义翻译成中文
+- 对 EPUB 进行分块翻译而不是整本粗暴替换
+- 需要可视化查看进度、失败块和导出结果
 
-### Markdown
+## 功能特性
 
-Markdown parsing is AST-only and uses `remark`, GFM extensions, and `remark-math` when installed. There is no handwritten fallback parser.
+- 支持 `Markdown` 和 `EPUB`
+- Markdown 基于 AST 解析
+- EPUB 基于 XHTML / OPF / spine 解析
+- 块级翻译、单块重译、失败块批量重试
+- 导出 `Markdown`、双语 Markdown、`PDF`、双语 PDF、`EPUB`、双语 EPUB
+- API Key 和访问令牌都可保存在当前会话、`.env` 或容器环境变量
+- 支持反向代理、公开访问地址和子路径部署
+- 前端支持中文 / English 双语界面实时切换
+- 前端和后端可本地开发，也支持 Docker 一键部署
+- Docker 镜像内已包含 Chromium 和 Noto CJK 字体，中文 PDF 导出可直接使用
 
-### EPUB
+## 技术说明
 
-EPUB tasks are unpacked, resolved through `META-INF/container.xml` and the OPF package document, then mapped block-by-block from XHTML spine content. Export rewrites validated XHTML fragments back into the source EPUB tree before repacking.
+- 后端：Node.js 原生 HTTP 服务
+- 前端：React + Vite
+- EPUB 工具链：Python 3
+- 翻译接口：兼容 OpenAI Chat Completions 协议的提供商
 
-## Translation mode
+当前默认配置偏向 DeepSeek，但也可以接到其他兼容网关。
 
-Block translation uses the live DeepSeek-compatible chat completions API. Missing API credentials or provider failures are returned explicitly.
+## 快速开始
 
-## Secrets and deployment
+### 30 秒上手
 
-API keys are no longer persisted to `server/data/db.json` or returned in plaintext from the settings API.
+如果你只是想最快把应用跑起来，按下面 5 步做：
 
-- `PUT /api/settings` with `apiKey` only injects the key into the current server process memory
-- `POST /api/settings/api-key/dotenv` writes the key into the local `.env` file as `MARKDOWN_TRANSLATOR_API_KEY` and activates it immediately
-- `DELETE /api/settings/api-key?scope=session|dotenv|all` clears the session key and/or removes it from `.env`
-- The local `.env` file is already ignored by Git via `.gitignore`
-- To survive restarts locally, keep the key in `.env` rather than in the task database
+1. 准备一个可用的上游模型 `API Key`
+2. 在项目根目录创建 `.env`
+3. 执行 `docker compose up -d --build`
+4. 执行 `cat server/data/runtime/access-token`，复制自动生成的访问令牌
+5. 打开 `http://localhost:8787`，先粘贴访问令牌，再去“设置”页填 `API Base URL`、`Model` 和 `API Key`
 
-Example `.env`:
+最小 `.env` 示例：
 
 ```dotenv
-MARKDOWN_TRANSLATOR_API_KEY=sk-your-key
+MARKDOWN_TRANSLATOR_API_KEY=your_api_key
 PORT=8787
 ```
 
-## Export formats
+说明：
 
-- `markdown`
-- `markdown_bilingual`
-- `pdf`
-- `pdf_bilingual`
-- `epub` (EPUB tasks only)
-- `records`
-- `annotations`
-- `mapping`
+- `MARKDOWN_TRANSLATOR_API_KEY` 必须由你的模型服务商提供，项目不会自动生成它
+- `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 可以不写，容器首次启动时会自动生成
+- 如果你已经手动写了 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`，应用就直接使用你提供的值
 
-## Run
+### 第一次启动后你会看到什么
 
-```bash
-node server/index.js
+Docker 首次启动成功后，建议按这个顺序操作：
+
+1. 执行 `docker logs --tail 50 translate-book`
+2. 执行 `cat server/data/runtime/access-token`
+3. 浏览器打开 `http://localhost:8787`
+4. 页面会先要求输入访问令牌
+5. 输入后进入应用，再去“设置”页补全模型配置
+6. 返回“新建任务”页上传 `.md` 或 `.epub`
+7. 创建任务后进入详情页开始翻译
+8. 翻译完成后从右上角导出 `Markdown`、`PDF`、`EPUB` 或双语版本
+
+### 方式一：Docker 一键部署
+
+这是最适合直接使用的方式。
+
+1. 准备环境变量
+
+仓库根目录可直接放一个 `.env`：
+
+```dotenv
+MARKDOWN_TRANSLATOR_API_KEY=your_api_key
+MARKDOWN_TRANSLATOR_ACCESS_TOKEN=
+PORT=8787
 ```
 
-Default local URLs:
+也可以不写 `.env`，启动后在 Web 设置页里填入。
 
-- Service root: [http://localhost:8787/](http://localhost:8787/)
-- Health: [http://localhost:8787/health](http://localhost:8787/health)
-- JSON API docs: [http://localhost:8787/api/docs](http://localhost:8787/api/docs)
-- OpenAPI 3.1 YAML: [http://localhost:8787/openapi.yaml](http://localhost:8787/openapi.yaml)
+如果你准备把服务暴露到公网，建议同时设置：
 
-## Main endpoints
+```dotenv
+MARKDOWN_TRANSLATOR_ACCESS_TOKEN=replace-this-with-a-long-random-token
+```
 
-- `GET /api/settings`
-- `PUT /api/settings`
-- `POST /api/settings/api-key/dotenv`
-- `DELETE /api/settings/api-key?scope=session|dotenv|all`
-- `GET /api/tasks`
-- `POST /api/tasks`
-- `GET /api/tasks/{taskId}`
-- `DELETE /api/tasks/{taskId}`
-- `POST /api/tasks/{taskId}/parse`
-- `GET /api/tasks/{taskId}/status`
-- `POST /api/tasks/{taskId}/translate`
-- `POST /api/tasks/{taskId}/pause`
-- `POST /api/tasks/{taskId}/resume`
-- `POST /api/tasks/{taskId}/cancel`
-- `GET /api/tasks/{taskId}/blocks/{blockId}`
-- `GET /api/tasks/{taskId}/blocks/{blockId}/prompt`
-- `POST /api/tasks/{taskId}/blocks/{blockId}/translate`
-- `POST /api/tasks/{taskId}/blocks/{blockId}/retranslate`
-- `POST /api/tasks/{taskId}/blocks/retranslate-batch`
-- `PATCH /api/tasks/{taskId}/blocks/{blockId}`
-- `POST /api/tasks/{taskId}/annotations`
-- `GET /api/tasks/{taskId}/exports/{format}`
+设置后，除 `/api`、`/api/docs`、`/api/openapi.yaml` 外，其余 API 都需要携带访问令牌。
 
-## Docs
+如果你没有提供 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`，容器会在首次启动时自动生成一个高强度访问令牌，并持久化到：
 
-- Markdown guide: [docs/markdown-translator-backend-api.md](F:/project/translate-books/docs/markdown-translator-backend-api.md)
-- OpenAPI YAML: [docs/openapi.yaml](F:/project/translate-books/docs/openapi.yaml)
+```text
+./server/data/runtime/access-token
+```
 
+你可以用下面这条命令直接查看并复制：
+
+```bash
+cat server/data/runtime/access-token
+```
+
+2. 启动
+
+```bash
+docker compose up -d --build
+```
+
+`docker-compose.yml` 会自动把宿主机 `.env` 中的 `MARKDOWN_TRANSLATOR_API_KEY` 和 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 传进容器；如果访问令牌为空，entrypoint 会在第一次启动时自动生成并落盘。
+
+3. 打开页面
+
+- Web UI: `http://localhost:8787`
+- Health: `http://localhost:8787/health`
+- API Root: `http://localhost:8787/api`
+
+4. 停止
+
+```bash
+docker compose down
+```
+
+默认会把 `./server/data` 挂载到容器内，用于持久化任务数据和导出所需的临时文件。
+
+首次启动后建议再执行一次：
+
+```bash
+cat server/data/runtime/access-token
+```
+
+这个文件里的值就是当前实例使用的访问令牌。只要你不手动删除该文件，后续重启会一直复用同一个值。
+
+### 方式二：本地开发
+
+要求：
+
+- Node.js `22+`
+- Python `3.10+`
+- 如果要本地导出中文 / 日文 / 韩文 PDF，建议额外安装 `Chromium` 或 `Chrome` 和 CJK 字体
+
+安装依赖：
+
+```bash
+npm install
+npm install --prefix web
+```
+
+启动开发环境：
+
+```bash
+npm run dev
+```
+
+默认地址：
+
+- 前端：`http://localhost:5173`
+- 后端：`http://localhost:8787`
+
+注意：
+
+- 本地开发模式不会走 Docker entrypoint，所以不会自动生成访问令牌
+- 如果你需要访问保护，可以在设置页手动填写访问令牌，或者在启动前自己设置 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`
+- 本地如果没有可用的 Chromium / Chrome，CJK PDF 导出会明确报错，而不是继续生成乱码 PDF
+
+## 配置项
+
+项目支持以下 API Key 来源，优先级从高到低：
+
+1. 当前后端会话内保存的 Key
+2. 进程环境变量
+3. 本地 `.env`
+
+支持读取的环境变量名：
+
+- `MARKDOWN_TRANSLATOR_API_KEY`
+- `DEEPSEEK_API_KEY`
+- `TRANSLATOR_API_KEY`
+
+常用环境变量：
+
+```dotenv
+MARKDOWN_TRANSLATOR_API_KEY=
+MARKDOWN_TRANSLATOR_ACCESS_TOKEN=
+PORT=8787
+```
+
+访问令牌支持来源：
+
+1. 当前后端会话内保存的访问令牌
+2. 进程环境变量 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`
+3. 本地 `.env`
+
+访问令牌的用途：
+
+- 保护任务列表、任务详情、导出、设置等敏感 API
+- 防止把应用挂到公网后被任何人直接枚举和下载文档内容
+
+访问令牌不是模型 `API Key`，它们是两个完全不同的东西：
+
+- `API Key`：用来访问上游模型服务
+- `Access Token`：用来保护你自己部署的这个应用
+
+设置页里的反代相关配置：
+
+- `publicBaseUrl`
+  用于声明最终对外访问地址，例如 `https://books.example.com`
+  或 `https://books.example.com/translator`
+- `trustProxyHeaders`
+  开启后会信任 `X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Forwarded-Prefix`
+  这些头，一般只在 Nginx / Caddy / Traefik 等可信反代后启用
+
+说明：
+
+- 通过设置页“保存”写入的 API Key / 访问令牌，是当前后端会话级别，远程浏览器也可以操作
+- 通过设置页写入或删除 `.env` 的操作，仍然只允许本机回环访问
+
+## 使用流程
+
+### 第一次使用 Web 界面
+
+对于第一次接触这个项目的用户，推荐按照下面顺序点击：
+
+1. 打开应用首页
+2. 如果出现“访问令牌”弹窗，先输入访问令牌
+3. 点击左侧“设置”
+4. 填写以下最关键的 4 个字段：
+   - `API Provider`
+   - `API Base URL`
+   - `Model`
+   - `API Key`
+5. 点击“保存到当前会话”
+6. 返回左侧“新建任务”
+7. 上传一个 `.epub` 或 `.md`
+8. 进入任务详情页后点击“开始全文翻译”
+9. 翻译完成后点击右上角“导出”
+
+如果你使用 LiteLLM / OpenAI 兼容网关，`API Base URL` 通常应该是类似下面这种根地址：
+
+```text
+http://127.0.0.1:4000/v1
+https://your-gateway.example.com/v1
+```
+
+后端会自动拼接 `/chat/completions`，不要手动再补一层。
+
+### 任务页怎么用
+
+任务详情页里最常用的几个功能：
+
+- 右上角 `导出`
+  翻译完成后导出 Markdown / PDF / EPUB，EPUB 任务还支持双语 EPUB
+- `双语对照 / 仅原文 / 仅译文`
+  切换阅读模式
+- `分页模式 / 长卷滚动`
+  控制任务页的浏览方式
+- 左侧固定错误面板
+  在宽屏下可直接点击“上一个错误 / 下一个错误 / 重试全部”
+- 失败块上的 `确认 / 忽略 / 重试`
+  用于处理模型返回不稳定、结构校验失败或翻译质量问题
+
+如果某个 EPUB 失败块显示“模型原始返回但未通过结构校验”，说明系统已经保留了原始模型输出，但为了避免写坏 EPUB，不会允许你直接确认写回；这时优先使用“重试”。
+
+### 导出行为说明
+
+- 纯译文导出不会再把未翻译块悄悄回退成原文
+- 如果某个可翻译块尚未完成，导出文件会写入显式占位标记，方便人工检查
+- 双语 Markdown 即使“原文和译文完全相同”，也会保留两侧内容，不再静默丢掉目标侧
+- 双语 EPUB 会保留原文块，并在原文块后插入对应译文块；纯译文 EPUB 则会用译文替换原块
+- 导出文件名会跟随目标语言，例如 `book.en.pdf`、`book.zh-CN.epub`
+
+### EPUB 说明
+
+本项目不是把整本 EPUB 作为纯文本直接送给模型，而是：
+
+1. 解包 EPUB
+2. 读取 `META-INF/container.xml`
+3. 解析 `content.opf`
+4. 根据 spine 顺序读取 XHTML 内容
+5. 按块提取可翻译文本
+6. 回写翻译结果并重新打包导出
+
+对含有大量脚注、斜体、链接等内联 XHTML 的复杂段落，后端会优先使用占位符模式：
+
+- 把脚注、链接、斜体等结构转换为 `[[MTS_*]]` 占位符
+- 只让模型翻译带占位符的可读文本
+- 校验占位符数量与顺序
+- 再由后端把占位符还原为原 XHTML 结构
+
+这样做的目标是尽量保持：
+
+- 目录结构
+- XHTML 标签结构
+- 资源引用
+- 图片、链接、章节顺序
+
+## 部署方式
+
+### 单容器模式
+
+Docker 镜像会：
+
+- 构建前端静态资源
+- 运行后端 API
+- 直接由后端托管 `web/dist`
+
+所以生产环境只需要一个容器和一个端口。
+
+### Docker Compose
+
+最常用命令：
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+docker compose down
+```
+
+查看当前实例访问令牌：
+
+```bash
+cat server/data/runtime/access-token
+```
+
+强制重新生成访问令牌：
+
+```bash
+rm -f server/data/runtime/access-token
+docker compose restart
+```
+
+如果你想固定一个自定义访问令牌，不要删文件后等它自动生成，直接在宿主机 `.env` 里写：
+
+```dotenv
+MARKDOWN_TRANSLATOR_ACCESS_TOKEN=your-own-long-random-token
+```
+
+### 反向代理部署
+
+如果你打算通过域名访问，或者挂到子路径下，例如：
+
+- `https://books.example.com`
+- `https://books.example.com/translator`
+
+推荐这样配置：
+
+1. 先在应用设置页填写 `publicBaseUrl`
+2. 如果代理会带 `X-Forwarded-*` 头，再开启 `trustProxyHeaders`
+3. 将设置页生成的 Nginx / Caddy 示例复制到你的反代配置里
+
+当前版本已经支持：
+
+- 反代后的公开地址推导
+- `X-Forwarded-Prefix` 子路径访问
+- 前端路由与 API 路径自动跟随公开前缀
+
+### 手动构建镜像
+
+```bash
+docker build -t translate-book .
+docker run -d \
+  --name translate-book \
+  -p 8787:8787 \
+  -e MARKDOWN_TRANSLATOR_API_KEY=your_api_key \
+  -v $(pwd)/server/data:/app/server/data \
+  translate-book
+```
+
+## 点对点测试
+
+### 1. 后端 EPUB 冒烟测试
+
+```bash
+npm run test:epub
+```
+
+这个测试会验证：
+
+- EPUB 解析
+- 块映射
+- 翻译片段应用
+- EPUB 导出
+- 状态接口默认瘦身返回
+
+### 2. 导出与命名回归测试
+
+```bash
+npm run test:exports
+```
+
+这个测试会验证：
+
+- 纯译文导出对未完成块使用显式占位符
+- 双语 Markdown 不再丢失“原文 = 译文”的目标侧
+- Markdown / PDF / EPUB 导出文件名跟随目标语言
+
+### 3. 全量测试
+
+```bash
+npm test
+```
+
+### 4. 手工验证上传链路
+
+启动服务后上传一个 `.epub`，然后在浏览器开发者工具里确认：
+
+- 创建任务请求为 `POST /api/tasks?filename=...&documentFormat=epub`
+- 请求体是原始二进制
+- 不再是巨大的 `contentBase64` JSON
+
+### 5. 手工验证状态接口
+
+在任务详情页观察请求：
+
+- 分页模式只拉当前页
+- 长卷模式按页追加加载
+- 默认状态响应不再返回整份全量 `blocks`
+
+### 6. 手工验证导出
+
+导出 EPUB 时应直接命中：
+
+```text
+/api/tasks/:taskId/exports/epub?download=1
+```
+
+导出双语 EPUB 时应使用异步导出任务或选择前端菜单里的 `EPUB 双语`，对应格式为：
+
+```text
+epub_bilingual
+```
+
+浏览器会直接下载文件，而不是先收一个巨大的 base64 JSON。
+
+### 7. 手工验证反向代理
+
+1. 在设置页把 `publicBaseUrl` 设成你的最终访问地址
+2. 如有 Nginx / Caddy，按设置页示例加上 `X-Forwarded-Host`、`X-Forwarded-Proto`
+3. 如果挂在子路径下，再加 `X-Forwarded-Prefix`
+4. 访问代理后的地址，确认：
+
+- 首页能打开
+- 刷新任务详情页不会 404
+- 上传、轮询、导出都走代理域名
+- 任务导出链接不是裸露的后端内网地址
+
+### 8. 手工验证访问令牌保护
+
+1. 在设置页填入访问令牌并保存，或写入 `.env`
+2. 打开一个新的无痕窗口访问站点
+3. 首次进入时应弹出访问令牌输入框
+4. 未携带令牌时，任务列表、任务详情、导出接口都应返回 `401`
+5. 填入正确令牌后，上传、轮询、导出应恢复正常
+
+### 9. 手工验证双语切换
+
+打开左侧栏的语言切换按钮：
+
+- `中文`
+- `English`
+
+切换后应立即生效，包括：
+
+- 导航
+- 首页上传提示
+- 任务列表
+- 任务详情页状态和操作按钮
+- 设置页与反代说明
+
+## 目录结构
+
+```text
+.
+├─ server/                  后端服务
+│  ├─ index.js              HTTP 入口
+│  └─ lib/                  任务、翻译、EPUB、PDF 等核心逻辑
+├─ web/                     React 前端
+├─ scripts/
+│  ├─ dev.mjs               本地开发启动脚本
+│  ├─ epub_tool.py          跨平台 EPUB 工具
+│  └─ epub_tool.ps1         Windows 兼容 EPUB 工具
+├─ docs/                    API 与设计文档
+├─ Dockerfile
+└─ docker-compose.yml
+```
+
+## 常见问题
+
+### 1. Docker 已启动，但无法翻译
+
+通常是 API Key 未配置。
+
+检查：
+
+- 容器环境变量里是否有 `MARKDOWN_TRANSLATOR_API_KEY`
+- 或者进入 Web 设置页重新保存 Key
+
+### 2. 第一次打开页面就要求访问令牌，但我不知道令牌是什么
+
+如果你没有在 `.env` 里手动指定访问令牌，Docker 容器会在首次启动时自动生成一个，并写入：
+
+```bash
+cat server/data/runtime/access-token
+```
+
+把它复制到浏览器弹窗即可。
+
+### 3. 公网部署后接口不通或导出提示未授权
+
+优先检查：
+
+- 是否已经配置 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`
+- 浏览器是否已在弹窗或设置页保存访问令牌
+- 反向代理是否允许 `Authorization` 请求头透传
+- 如果是跨域访问，代理是否允许 `Content-Disposition` 响应头透出
+
+### 4. EPUB 上传很慢
+
+新版本已经把上传方式改成二进制直传。
+
+如果仍然慢，优先检查：
+
+- 浏览器与服务器之间的网络
+- 宿主机磁盘性能
+- 模型接口本身延迟
+
+### 5. 前端页面打不开
+
+如果是 Docker 部署，确认：
+
+- `docker compose ps` 显示容器已运行
+- `http://localhost:8787/health` 返回正常
+
+如果是本地开发，确认：
+
+- `npm run dev` 已同时启动前后端
+- 前端在 `5173`
+- 后端在 `8787`
+
+### 6. EPUB 导出失败
+
+优先检查：
+
+- 源 EPUB 是否包含非标准 XHTML
+- 失败块是否存在结构异常
+- 任务是否是旧容器/旧本地路径创建的；当前版本会自动修复常见的 stale asset 绝对路径，如果仍提示 assets missing，建议重新导入或重解析 EPUB
+- 后端日志里的 `epub_processing_failed`
+
+### 7. 某些 EPUB 块反复提示 “returned N EPUB segments, expected M”
+
+这通常不是文件损坏，而是模型偶尔没有按要求返回正确数量的段。
+
+当前版本已经做了多层处理：
+
+- 更宽松地解析常见的包裹格式
+- 在必要时自动发起一次“修复格式”的二次请求
+- 对复杂内联 XHTML 段落自动切换到占位符模式，减少模型合并/漏掉脚注段导致的失败
+
+如果仍然失败，建议：
+
+1. 先点击失败块上的“重试”
+2. 检查该块是否过长、是否包含大量脚注或内联标签
+3. 降低模型温度，或换一个更稳定的模型
+4. 查看后端日志，确认是不是上游网关对 JSON 输出做了额外包装
+
+## 开发说明
+
+本地开发建议：
+
+```bash
+npm run dev
+```
+
+仅启动后端：
+
+```bash
+npm run dev:api
+```
+
+仅启动前端：
+
+```bash
+npm run dev:web
+```
+
+## 版本与目标
+
+当前版本重点是：
+
+- 修复 EPUB 可用性
+- 降低长文档上传、轮询、导出的额外开销
+- 提供更可靠的 Docker 部署方式
+
+后续仍可继续完善：
+
+- 更强的 EPUB 兼容测试集
+- 更细粒度的状态增量推送
+- 更多提供商适配
+
+## License
+
+如需公开发布到 GitHub，建议在仓库中补充正式的 `LICENSE` 文件。

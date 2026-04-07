@@ -6,7 +6,10 @@
     "start": "node server/index.js",
     "dev": "node scripts/dev.mjs",
     "dev:api": "node server/index.js",
-    "dev:web": "npm run dev --prefix web"
+    "dev:web": "npm run dev --prefix web",
+    "test": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/*.test.js",
+    "test:epub": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/epub-pipeline.test.js",
+    "test:exports": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/export-behavior.test.js"
   },
   "dependencies": {
     "mdast-util-from-markdown": "^2.0.2",
@@ -15,9 +18,10 @@
     "mdast-util-to-markdown": "^2.1.2",
     "micromark-extension-gfm": "^3.0.0",
     "micromark-extension-math": "^3.1.0",
+    "playwright-core": "^1.59.1",
+    "remark": "^15.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
-    "remark": "^15.0.1",
     "unified": "^11.0.5"
   }
 }

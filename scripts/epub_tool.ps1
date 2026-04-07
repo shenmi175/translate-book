@@ -8,7 +8,8 @@ param(
   [string]$OutputPath,
   [string]$SourceFragmentBase64,
   [string]$TranslatedFragmentBase64,
-  [string]$TranslatedSegmentsBase64
+  [string]$TranslatedSegmentsBase64,
+  [string]$Layout = 'translation-only'
 )
 
 Set-StrictMode -Version Latest
@@ -93,6 +94,16 @@ function Normalize-Whitespace([string]$Value) {
     return ''
   }
   return ([System.Text.RegularExpressions.Regex]::Replace($Value, '\s+', ' ')).Trim()
+}
+
+function Normalize-PreviewWhitespace([string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return ''
+  }
+  $normalized = [System.Text.RegularExpressions.Regex]::Replace($Value, '[^\S\n]+', ' ')
+  $normalized = [System.Text.RegularExpressions.Regex]::Replace($normalized, ' *\n *', "`n")
+  $normalized = [System.Text.RegularExpressions.Regex]::Replace($normalized, '\n{3,}', "`n`n")
+  return $normalized.Trim()
 }
 
 function Get-CollectionCount($Value) {
@@ -210,7 +221,7 @@ function Get-StructureSignature([System.Xml.XmlNode]$Node) {
   return ('<{0}|{1}>{2}</{0}>' -f $Node.LocalName, $attributePart, ($children -join ''))
 }
 
-function Get-VisibleText([System.Xml.XmlNode]$Node) {
+function Get-VisibleText([System.Xml.XmlNode]$Node, [switch]$PreserveBreaks) {
   $parts = New-Object System.Collections.Generic.List[string]
   function Visit([System.Xml.XmlNode]$InnerNode) {
     if ($InnerNode.NodeType -eq [System.Xml.XmlNodeType]::Text -or $InnerNode.NodeType -eq [System.Xml.XmlNodeType]::CDATA) {
@@ -225,6 +236,10 @@ function Get-VisibleText([System.Xml.XmlNode]$Node) {
     if ($name -in @('script', 'style')) {
       return
     }
+    if ($PreserveBreaks -and $name -eq 'br') {
+      [void]$parts.Add("`n")
+      return
+    }
     if ($name -eq 'img' -and $InnerNode.Attributes['alt']) {
       $altText = Normalize-Whitespace $InnerNode.Attributes['alt'].Value
       if ($altText) { [void]$parts.Add($altText) }
@@ -234,7 +249,11 @@ function Get-VisibleText([System.Xml.XmlNode]$Node) {
     }
   }
   Visit $Node
-  return ($parts -join ' ').Trim()
+  $joined = ($parts -join ' ')
+  if ($PreserveBreaks) {
+    return Normalize-PreviewWhitespace $joined
+  }
+  return $joined.Trim()
 }
 
 function Get-TranslatableSegmentDescriptors([System.Xml.XmlElement]$RootElement) {
@@ -442,7 +461,7 @@ function Get-BlockType([System.Xml.XmlElement]$Element) {
 }
 
 function Get-PreviewForBlock([System.Xml.XmlElement]$Element, [string]$BlockType) {
-  $visibleText = Get-VisibleText $Element
+  $visibleText = Get-VisibleText $Element -PreserveBreaks
   switch ($BlockType) {
     'heading' {
       $level = 1
@@ -453,7 +472,11 @@ function Get-PreviewForBlock([System.Xml.XmlElement]$Element, [string]$BlockType
     }
     'paragraph' { return $visibleText }
     'list_item' { return ('- ' + $visibleText).Trim() }
-    'blockquote' { return ('> ' + $visibleText).Trim() }
+    'blockquote' {
+      return (($visibleText -split "`n" | ForEach-Object {
+        if ($_ -eq '') { '>' } else { '> ' + $_ }
+      }) -join "`n").Trim()
+    }
     'table' { return Get-TablePreview $Element }
     'fenced_code' { return ('```' + "`n" + $Element.InnerText.Trim() + "`n" + '```') }
     'image' {
@@ -793,6 +816,36 @@ function Merge-TranslatedElement([System.Xml.XmlElement]$SourceElement, [System.
   }
 }
 
+function Mark-BilingualTranslationElement([System.Xml.XmlElement]$Element) {
+  $classValue = if ($Element.Attributes['class']) { $Element.Attributes['class'].Value } else { '' }
+  $classNames = @($classValue -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($classNames -notcontains 'mts-translation') {
+    $classNames += 'mts-translation'
+  }
+  $Element.SetAttribute('class', ($classNames -join ' '))
+  $Element.SetAttribute('data-mts-role', 'translation')
+}
+
+function Insert-TranslatedElementAfter([System.Xml.XmlElement]$SourceElement, [System.Xml.XmlElement]$TranslatedElement) {
+  if ($SourceElement.LocalName -ne $TranslatedElement.LocalName) {
+    throw 'Translated fragment root does not match the source fragment root.'
+  }
+  if ((Get-StructureSignature $SourceElement) -ne (Get-StructureSignature $TranslatedElement)) {
+    throw 'Translated fragment structure does not match the source fragment.'
+  }
+  if ($null -eq $SourceElement.ParentNode) {
+    throw 'EPUB export could not resolve the translated block parent.'
+  }
+
+  $imported = $SourceElement.OwnerDocument.ImportNode($TranslatedElement, $true)
+  Mark-BilingualTranslationElement ([System.Xml.XmlElement]$imported)
+  if ($null -ne $SourceElement.NextSibling) {
+    [void]$SourceElement.ParentNode.InsertAfter($imported, $SourceElement)
+  } else {
+    [void]$SourceElement.ParentNode.AppendChild($imported)
+  }
+}
+
 function Invoke-ParseMode {
   $normalizedTaskDir = [System.IO.Path]::GetFullPath($TaskDir)
   Ensure-Directory $normalizedTaskDir
@@ -916,6 +969,10 @@ function Invoke-ApplySegmentsMode {
 
 function Invoke-ExportMode {
   $task = Read-JsonFile $TaskJsonPath
+  $normalizedLayout = if ([string]::IsNullOrWhiteSpace($Layout)) { 'translation-only' } else { $Layout.ToLowerInvariant() }
+  if ($normalizedLayout -notin @('translation-only', 'bilingual')) {
+    throw 'EPUB export layout must be translation-only or bilingual.'
+  }
   $sourceRoot = $task.asset.extractRoot
   if (-not (Test-Path -LiteralPath $sourceRoot)) {
     throw 'EPUB source assets are missing for this task.'
@@ -929,7 +986,12 @@ function Invoke-ExportMode {
   $chapterDocuments = @{}
   $packageFullPath = Join-Path $activeRoot ($task.asset.packagePath -replace '/', [System.IO.Path]::DirectorySeparatorChar)
   $packageDirectory = [System.IO.Path]::GetDirectoryName($packageFullPath)
-  foreach ($block in $task.blocks) {
+  $exportBlocks = @($task.blocks)
+  if ($normalizedLayout -eq 'bilingual') {
+    $exportBlocks = @($exportBlocks | Sort-Object -Property @{ Expression = { [int]$_.order }; Descending = $true })
+  }
+
+  foreach ($block in $exportBlocks) {
     if (-not $block.shouldTranslate) { continue }
     if ($block.status -notin @('translated', 'edited', 'retranslated')) { continue }
     if ($null -eq $block.translationUnit -or [string]::IsNullOrWhiteSpace($block.translationUnit.translatedFragment)) { continue }
@@ -944,7 +1006,11 @@ function Invoke-ExportMode {
       throw "EPUB export could not find block node $($block.translationUnit.nodePath) in $($block.translationUnit.chapterPath)."
     }
     $translatedDoc = Get-XmlDocumentFromString $block.translationUnit.translatedFragment
-    Merge-TranslatedElement $targetNode $translatedDoc.DocumentElement
+    if ($normalizedLayout -eq 'bilingual') {
+      Insert-TranslatedElementAfter $targetNode $translatedDoc.DocumentElement
+    } else {
+      Merge-TranslatedElement $targetNode $translatedDoc.DocumentElement
+    }
   }
 
   foreach ($entry in $chapterDocuments.GetEnumerator()) {
@@ -975,9 +1041,5 @@ switch ($Mode) {
   'export' { Invoke-ExportMode; break }
   default { throw "Unsupported mode: $Mode" }
 }
-
-
-
-
 
 

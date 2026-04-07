@@ -104,6 +104,8 @@ export const DEFAULT_SETTINGS = {
   apiProvider: "DeepSeek",
   apiKey: "",
   apiBaseUrl: "https://api.deepseek.com",
+  publicBaseUrl: "",
+  trustProxyHeaders: false,
   model: "deepseek-chat",
   sourceLanguage: "English",
   targetLanguage: "Chinese",

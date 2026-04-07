@@ -1,0 +1,14 @@
+.git
+.gitignore
+.codex
+node_modules
+web/node_modules
+web/dist
+server/data/db.json
+server/data/tasks
+tmp
+dist
+test
+*.log
+__pycache__
+*.pyc

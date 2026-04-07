@@ -1,0 +1,15 @@
+services:
+  translate-book:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: translate-book
+    ports:
+      - "${PORT:-8787}:8787"
+    environment:
+      PORT: 8787
+      MARKDOWN_TRANSLATOR_API_KEY: ${MARKDOWN_TRANSLATOR_API_KEY:-}
+      MARKDOWN_TRANSLATOR_ACCESS_TOKEN: ${MARKDOWN_TRANSLATOR_ACCESS_TOKEN:-}
+    volumes:
+      - ./server/data:/app/server/data
+    restart: unless-stopped

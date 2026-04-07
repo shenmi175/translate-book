@@ -73,6 +73,45 @@ const PREFIX_BY_TYPE = {
 
 const TRANSLATABLE_TYPES = new Set(["heading", "paragraph", "list_item", "blockquote", "table", "image"]);
 const PARAGRAPH_LIKE_TYPES = new Set(["heading", "paragraph", "list_item", "blockquote"]);
+const COMPLETED_TRANSLATION_STATUSES = new Set(["translated", "edited", "retranslated"]);
+
+export function hasCompletedTranslation(block = {}) {
+  return Boolean(
+    block?.shouldTranslate &&
+      COMPLETED_TRANSLATION_STATUSES.has(block.status) &&
+      typeof block.translatedMarkdown === "string" &&
+      block.translatedMarkdown.trim()
+  );
+}
+
+export function buildPendingTranslationPlaceholder(block = {}, variant = "markdown") {
+  const blockId = block?.id || "unknown-block";
+  const status = block?.status || "idle";
+  const label = `[TRANSLATION PENDING ${blockId} status=${status}]`;
+  return variant === "markdown" ? label : label;
+}
+
+export function pickExportMarkdown(block = {}, mode = "target_only") {
+  const source = typeof block.sourceMarkdown === "string" ? block.sourceMarkdown : "";
+  if (!block.shouldTranslate) {
+    return source;
+  }
+
+  if (mode === "bilingual") {
+    const target = hasCompletedTranslation(block)
+      ? block.translatedMarkdown || source
+      : buildPendingTranslationPlaceholder(block, "markdown");
+    return `${source}\n\n${target}`;
+  }
+
+  if (mode === "target_only") {
+    return hasCompletedTranslation(block)
+      ? block.translatedMarkdown || source
+      : buildPendingTranslationPlaceholder(block, "markdown");
+  }
+
+  return source;
+}
 
 function isBlank(line) {
   return /^\s*$/.test(line);
@@ -731,18 +770,7 @@ export function parseMarkdownDocument(markdown) {
 export function mergeMarkdown(blocks, mode = 'target_only') {
   return blocks
     .map((block) => {
-      let text = block.sourceMarkdown;
-      const isTranslated = block.shouldTranslate && ["translated", "edited", "retranslated"].includes(block.status);
-      
-      if (mode === 'bilingual' && isTranslated) {
-         const target = block.translatedMarkdown || block.sourceMarkdown;
-         if (target && target !== text) {
-             text = text + "\n\n" + target;
-         }
-      } else if (mode === 'target_only') {
-         text = isTranslated ? (block.translatedMarkdown || block.sourceMarkdown) : block.sourceMarkdown;
-      }
-      
+      const text = pickExportMarkdown(block, mode);
       return `${text}${block.separatorAfter || ""}`;
     })
     .join("");

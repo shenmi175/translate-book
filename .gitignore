@@ -1,9 +1,13 @@
 ﻿node_modules/
 web/node_modules/
 server/data/db.json
+server/data/runtime/
+server/data/export-cache/
 .env
 .env.*
 !.env.example
 tmp/
 dist/
 web/dist/
+__pycache__/
+*.pyc

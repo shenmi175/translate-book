@@ -1,5 +1,7 @@
 ﻿import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readFile as readFileAsync, rm as rmAsync, writeFile as writeFileAsync } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -8,16 +10,26 @@ import {
   RETRANSLATION_PROMPT_TEMPLATE,
   SYSTEM_PROMPT
 } from "../data/default-prompts.js";
+import { resolveExportLanguage } from "./export-language.js";
 import { mergeMarkdown, parseMarkdownDocument } from "./markdown.js";
 import { buildPdfExport } from "./pdf-export.js";
 import { buildEpubExport, parseEpubArchive, removeTaskArtifacts, reparseEpubArchive } from "./epub-service.js";
-import { applyEpubTranslationUnit } from "./epub-hotpath.js";
+import { applyEpubPlaceholderBestEffortTranslation, applyEpubPlaceholderTranslation, applyEpubTranslationUnit, buildEpubPlaceholderPlan, buildEpubPreviewFromNormalizedFragment } from "./epub-hotpath.js";
 import { testChatCompletionsConnection, translateWithDeepSeek } from "./translation-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "../..");
-const DB_PATH = path.join(__dirname, "../data/db.json");
+const DEFAULT_DB_PATH = path.join(__dirname, "../data/db.json");
+const DB_PATH = process.env.MARKDOWN_TRANSLATOR_DB_PATH
+  ? path.resolve(process.env.MARKDOWN_TRANSLATOR_DB_PATH)
+  : DEFAULT_DB_PATH;
 const DOTENV_PATH = path.join(ROOT_DIR, ".env");
+const DEFAULT_EXPORT_CACHE_DIR = path.join(__dirname, "../data/export-cache");
+const CONFIGURED_EXPORT_CACHE_DIR = process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR
+  ? path.resolve(process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR)
+  : DEFAULT_EXPORT_CACHE_DIR;
+const FALLBACK_EXPORT_CACHE_DIR = path.join(os.tmpdir(), "translate-book-export-cache");
+let resolvedExportCacheDir = "";
 
 export const SERVICE_INFO = {
   name: "Markdown and EPUB Translator Backend",
@@ -25,7 +37,8 @@ export const SERVICE_INFO = {
   description: "A pure REST backend for block-safe Markdown and EPUB translation workflows."
 };
 
-export const EXPORT_FORMATS = ["markdown", "markdown_bilingual", "records", "annotations", "mapping", "pdf", "pdf_bilingual", "epub"];
+export const EXPORT_FORMATS = ["markdown", "markdown_bilingual", "records", "annotations", "mapping", "pdf", "pdf_bilingual", "epub", "epub_bilingual"];
+const EXPORT_JOB_STATUSES = ["queued", "running", "completed", "failed"];
 export const BLOCK_STATUSES = [
   "idle",
   "queued",
@@ -49,8 +62,11 @@ const taskAbortControllers = new Map();
 const MANAGED_API_KEY_DOTENV_KEY = "MARKDOWN_TRANSLATOR_API_KEY";
 const LEGACY_API_KEY_DOTENV_KEYS = ["DEEPSEEK_API_KEY", "TRANSLATOR_API_KEY"];
 const DOTENV_API_KEY_KEYS = [MANAGED_API_KEY_DOTENV_KEY, ...LEGACY_API_KEY_DOTENV_KEYS];
+const MANAGED_ACCESS_TOKEN_DOTENV_KEY = "MARKDOWN_TRANSLATOR_ACCESS_TOKEN";
+const DOTENV_ACCESS_TOKEN_KEYS = [MANAGED_ACCESS_TOKEN_DOTENV_KEY];
 const runtimeSecrets = {
-  apiKey: ""
+  apiKey: "",
+  accessToken: ""
 };
 let appSettings = structuredClone(DEFAULT_SETTINGS);
 const PROMPT_CONFIG_FIELDS = [
@@ -75,12 +91,22 @@ function isLikelyMojibake(value = "") {
 function stripSecretFields(settings = {}) {
   const next = { ...settings };
   next.apiKey = "";
+  next.accessToken = "";
   delete next.hasApiKey;
   delete next.maskedApiKey;
   delete next.apiKeySource;
   delete next.apiKeyStorageKey;
   delete next.apiKeyPersistence;
   delete next.apiKeyDotenvPath;
+  delete next.apiKeyMutationGuard;
+  delete next.hasAccessToken;
+  delete next.maskedAccessToken;
+  delete next.accessTokenSource;
+  delete next.accessTokenStorageKey;
+  delete next.accessTokenPersistence;
+  delete next.accessTokenDotenvPath;
+  delete next.accessTokenMutationGuard;
+  delete next.authRequired;
   return next;
 }
 
@@ -191,6 +217,65 @@ function getDotenvApiKey() {
   };
 }
 
+function getProcessEnvApiKey() {
+  for (const keyName of DOTENV_API_KEY_KEYS) {
+    const value = typeof process.env[keyName] === "string" ? process.env[keyName].trim() : "";
+    if (value) {
+      return {
+        value,
+        storageKey: keyName,
+        scope: "environment"
+      };
+    }
+  }
+
+  return {
+    value: "",
+    storageKey: "",
+    scope: "none"
+  };
+}
+
+function getDotenvAccessToken() {
+  const entries = readDotenvEntries();
+  for (const keyName of DOTENV_ACCESS_TOKEN_KEYS) {
+    const pair = entries.find((entry) => entry.type === "pair" && entry.key === keyName);
+    const value = pair ? decodeDotenvValue(pair.value) : "";
+    if (value) {
+      return {
+        value,
+        storageKey: keyName,
+        scope: "dotenv-file"
+      };
+    }
+  }
+
+  return {
+    value: "",
+    storageKey: "",
+    scope: "none"
+  };
+}
+
+function getProcessEnvAccessToken() {
+  for (const keyName of DOTENV_ACCESS_TOKEN_KEYS) {
+    const value = typeof process.env[keyName] === "string" ? process.env[keyName].trim() : "";
+    if (value) {
+      return {
+        value,
+        storageKey: keyName,
+        scope: "environment"
+      };
+    }
+  }
+
+  return {
+    value: "",
+    storageKey: "",
+    scope: "none"
+  };
+}
+
 function writeManagedApiKeyToDotenv(apiKey) {
   const entries = readDotenvEntries();
   const nextEntries = [];
@@ -227,9 +312,51 @@ function writeManagedApiKeyToDotenv(apiKey) {
   writeDotenvEntries(nextEntries);
 }
 
+function writeManagedAccessTokenToDotenv(accessToken) {
+  const entries = readDotenvEntries();
+  const nextEntries = [];
+  let replaced = false;
+
+  for (const entry of entries) {
+    if (entry.type === "pair" && DOTENV_ACCESS_TOKEN_KEYS.includes(entry.key)) {
+      if (!replaced) {
+        nextEntries.push({
+          ...entry,
+          key: MANAGED_ACCESS_TOKEN_DOTENV_KEY,
+          value: encodeDotenvValue(accessToken)
+        });
+        replaced = true;
+      }
+      continue;
+    }
+    nextEntries.push(entry);
+  }
+
+  if (!replaced) {
+    if (nextEntries.length && nextEntries[nextEntries.length - 1].type === "raw" && nextEntries[nextEntries.length - 1].raw !== "") {
+      nextEntries.push({ type: "raw", raw: "" });
+    }
+    nextEntries.push({
+      type: "pair",
+      indent: "",
+      key: MANAGED_ACCESS_TOKEN_DOTENV_KEY,
+      separator: "=",
+      value: encodeDotenvValue(accessToken)
+    });
+  }
+
+  writeDotenvEntries(nextEntries);
+}
+
 function clearManagedApiKeyFromDotenv() {
   const entries = readDotenvEntries();
   const nextEntries = entries.filter((entry) => !(entry.type === "pair" && DOTENV_API_KEY_KEYS.includes(entry.key)));
+  writeDotenvEntries(nextEntries);
+}
+
+function clearManagedAccessTokenFromDotenv() {
+  const entries = readDotenvEntries();
+  const nextEntries = entries.filter((entry) => !(entry.type === "pair" && DOTENV_ACCESS_TOKEN_KEYS.includes(entry.key)));
   writeDotenvEntries(nextEntries);
 }
 
@@ -243,7 +370,55 @@ function getResolvedApiKey() {
     };
   }
 
+  const processEnvSecret = getProcessEnvApiKey();
+  if (processEnvSecret.value) {
+    return {
+      value: processEnvSecret.value,
+      source: "env",
+      storageKey: processEnvSecret.storageKey,
+      storageScope: processEnvSecret.scope || "environment"
+    };
+  }
+
   const dotenvSecret = getDotenvApiKey();
+  if (dotenvSecret.value) {
+    return {
+      value: dotenvSecret.value,
+      source: "dotenv",
+      storageKey: dotenvSecret.storageKey,
+      storageScope: dotenvSecret.scope || "dotenv-file"
+    };
+  }
+
+  return {
+    value: "",
+    source: "none",
+    storageKey: "",
+    storageScope: "none"
+  };
+}
+
+function getResolvedAccessToken() {
+  if (runtimeSecrets.accessToken) {
+    return {
+      value: runtimeSecrets.accessToken,
+      source: "session",
+      storageKey: "",
+      storageScope: "memory-only"
+    };
+  }
+
+  const processEnvSecret = getProcessEnvAccessToken();
+  if (processEnvSecret.value) {
+    return {
+      value: processEnvSecret.value,
+      source: "env",
+      storageKey: processEnvSecret.storageKey,
+      storageScope: processEnvSecret.scope || "environment"
+    };
+  }
+
+  const dotenvSecret = getDotenvAccessToken();
   if (dotenvSecret.value) {
     return {
       value: dotenvSecret.value,
@@ -269,6 +444,62 @@ function buildEffectiveApiEndpoint(baseUrl = "") {
   return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
 }
 
+function normalizeBasePath(value = "") {
+  const trimmed = String(value || "").trim();
+  if (!trimmed || trimmed === "/") {
+    return "";
+  }
+
+  const normalized = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return normalized.replace(/\/+$/, "") || "";
+}
+
+function normalizePublicBaseUrl(value = "") {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw createError(400, "invalid_request", "publicBaseUrl must be a valid absolute URL.");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw createError(400, "invalid_request", "publicBaseUrl must start with http:// or https://.");
+  }
+
+  parsed.search = "";
+  parsed.hash = "";
+
+  const basePath = normalizeBasePath(parsed.pathname);
+  parsed.pathname = basePath || "/";
+
+  return basePath ? `${parsed.origin}${basePath}` : parsed.origin;
+}
+
+function extractPublicBasePath(publicBaseUrl = "") {
+  if (!publicBaseUrl) {
+    return "";
+  }
+
+  try {
+    return normalizeBasePath(new URL(publicBaseUrl).pathname);
+  } catch {
+    return "";
+  }
+}
+
+function buildPublicApiBaseUrl(publicBaseUrl = "") {
+  if (!publicBaseUrl) {
+    return "";
+  }
+
+  return `${publicBaseUrl}/api`;
+}
+
 function normalizePersistedSettings(settings = {}) {
   const next = { ...DEFAULT_SETTINGS, ...stripSecretFields(settings) };
 
@@ -278,13 +509,23 @@ function normalizePersistedSettings(settings = {}) {
     }
   }
 
+  next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
+  next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
   next.apiKey = "";
+  next.accessToken = "";
   delete next.hasApiKey;
   delete next.maskedApiKey;
   delete next.apiKeySource;
   delete next.apiKeyStorageKey;
   delete next.apiKeyPersistence;
   delete next.apiKeyDotenvPath;
+  delete next.hasAccessToken;
+  delete next.maskedAccessToken;
+  delete next.accessTokenSource;
+  delete next.accessTokenStorageKey;
+  delete next.accessTokenPersistence;
+  delete next.accessTokenDotenvPath;
+  delete next.authRequired;
   return next;
 }
 
@@ -293,7 +534,10 @@ function loadState() {
     if (fs.existsSync(DB_PATH)) {
       const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
       if (data.appSettings) {
-        if (typeof data.appSettings.apiKey === "string" && data.appSettings.apiKey.trim()) {
+        if (
+          (typeof data.appSettings.apiKey === "string" && data.appSettings.apiKey.trim()) ||
+          (typeof data.appSettings.accessToken === "string" && data.appSettings.accessToken.trim())
+        ) {
           pendingStateSanitize = true;
         }
         appSettings = normalizePersistedSettings(data.appSettings);
@@ -301,7 +545,10 @@ function loadState() {
       if (data.tasks) {
         for (const t of data.tasks) {
           if (t?.config) {
-            if (typeof t.config.apiKey === "string" && t.config.apiKey.trim()) {
+            if (
+              (typeof t.config.apiKey === "string" && t.config.apiKey.trim()) ||
+              (typeof t.config.accessToken === "string" && t.config.accessToken.trim())
+            ) {
               pendingStateSanitize = true;
             }
             t.config = normalizePersistedSettings(t.config);
@@ -310,6 +557,7 @@ function loadState() {
           }
           t.documentFormat = t.documentFormat || "markdown";
           t.asset = t.asset || null;
+          t.contentVersion = typeof t.contentVersion === "string" && t.contentVersion ? t.contentVersion : (t.updatedAt || t.createdAt || now());
           if (Array.isArray(t.blocks)) {
             for (const block of t.blocks) {
               block.promptSnapshot = null;
@@ -326,6 +574,7 @@ function loadState() {
           t.annotations = Array.isArray(t.annotations) ? t.annotations : [];
           t.comments = Array.isArray(t.comments) ? t.comments : [];
           t.activity = Array.isArray(t.activity) ? t.activity : [];
+          t.exportJobs = Array.isArray(t.exportJobs) ? t.exportJobs.map((job) => normalizePersistedExportJob(job)) : [];
           t.runtime = t.runtime && typeof t.runtime === "object" ? t.runtime : { sessionStartedAt: "", pendingQueue: [] };
           t.runtime.sessionStartedAt = typeof t.runtime.sessionStartedAt === "string" ? t.runtime.sessionStartedAt : "";
           t.runtime.pendingQueue = [];
@@ -346,6 +595,16 @@ function writeStateToDisk() {
     tasks: Array.from(tasks.values(), (task) => {
       const nextTask = structuredClone(task);
       nextTask.config = normalizePersistedSettings(nextTask.config);
+      nextTask.exports = {};
+      nextTask.exportJobs = ensureTaskExportJobs(nextTask).map((job) => normalizePersistedExportJob(job));
+      if (nextTask.runtime && typeof nextTask.runtime === "object") {
+        nextTask.runtime.pendingQueue = [];
+      }
+      if (Array.isArray(nextTask.blocks)) {
+        for (const block of nextTask.blocks) {
+          block.promptSnapshot = null;
+        }
+      }
       return nextTask;
     })
   };
@@ -383,7 +642,7 @@ function saveState() {
     } catch (error) {
       console.error("Failed to save state", error);
     }
-  }, 1000);
+  }, 3000);
 }
 
 getDotenvApiKey();
@@ -398,6 +657,204 @@ function clone(value) {
 
 function now() {
   return new Date().toISOString();
+}
+
+function markTaskContentChanged(task) {
+  task.contentVersion = now();
+}
+
+function normalizeExportJobProgress(progress = {}) {
+  const percent = Number(progress?.percent);
+  return {
+    percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, Math.round(percent))) : 0,
+    stage: typeof progress?.stage === "string" && progress.stage.trim() ? progress.stage.trim() : "queued",
+    detail: typeof progress?.detail === "string" ? progress.detail : "",
+    currentStep: Number.isInteger(progress?.currentStep) ? progress.currentStep : 0,
+    totalSteps: Number.isInteger(progress?.totalSteps) ? progress.totalSteps : 0
+  };
+}
+
+function normalizePersistedExportJob(job = {}) {
+  const artifact = job?.artifact && typeof job.artifact === "object" ? job.artifact : null;
+  return {
+    id: typeof job?.id === "string" && job.id ? job.id : randomUUID(),
+    format: typeof job?.format === "string" ? job.format : "markdown",
+    options: job?.options && typeof job.options === "object" && !Array.isArray(job.options) ? clone(job.options) : {},
+    signature: typeof job?.signature === "string" ? job.signature : "",
+    sourceVersion: typeof job?.sourceVersion === "string" ? job.sourceVersion : "",
+    status: EXPORT_JOB_STATUSES.includes(job?.status) ? job.status : "queued",
+    progress: normalizeExportJobProgress(job?.progress),
+    createdAt: typeof job?.createdAt === "string" ? job.createdAt : now(),
+    startedAt: typeof job?.startedAt === "string" ? job.startedAt : "",
+    finishedAt: typeof job?.finishedAt === "string" ? job.finishedAt : "",
+    errorMessage: typeof job?.errorMessage === "string" ? job.errorMessage : "",
+    artifact: artifact
+      ? {
+          filename: typeof artifact.filename === "string" ? artifact.filename : "",
+          mimeType: typeof artifact.mimeType === "string" ? artifact.mimeType : "application/octet-stream",
+          sizeBytes: Number.isFinite(Number(artifact.sizeBytes)) ? Number(artifact.sizeBytes) : 0,
+          cachePath: typeof artifact.cachePath === "string" ? artifact.cachePath : "",
+          renderer: typeof artifact.renderer === "string" ? artifact.renderer : "",
+          generatedAt: typeof artifact.generatedAt === "string" ? artifact.generatedAt : ""
+        }
+      : null
+  };
+}
+
+function ensureTaskExportJobs(task) {
+  if (!Array.isArray(task.exportJobs)) {
+    task.exportJobs = [];
+  }
+  return task.exportJobs;
+}
+
+function directoryIsWritable(directoryPath) {
+  try {
+    fs.mkdirSync(directoryPath, { recursive: true });
+    fs.accessSync(directoryPath, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getExportCacheDir() {
+  if (resolvedExportCacheDir) {
+    return resolvedExportCacheDir;
+  }
+
+  if (directoryIsWritable(CONFIGURED_EXPORT_CACHE_DIR)) {
+    resolvedExportCacheDir = CONFIGURED_EXPORT_CACHE_DIR;
+    return resolvedExportCacheDir;
+  }
+
+  if (!directoryIsWritable(FALLBACK_EXPORT_CACHE_DIR)) {
+    throw createError(500, "export_cache_unwritable", "Export cache directory is not writable.");
+  }
+
+  resolvedExportCacheDir = FALLBACK_EXPORT_CACHE_DIR;
+  return resolvedExportCacheDir;
+}
+
+function pathIsInsideDirectory(parentDirectory, childPath) {
+  const relative = path.relative(parentDirectory, childPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function exportJobCacheAbsolutePath(cachePath = "") {
+  const resolved = path.resolve(ROOT_DIR, cachePath || ".");
+  if (!pathIsInsideDirectory(getExportCacheDir(), resolved)) {
+    throw createError(500, "export_cache_invalid", "Cached export path is invalid.");
+  }
+  return resolved;
+}
+
+function exportJobHasCache(job) {
+  if (!job?.artifact?.cachePath) {
+    return false;
+  }
+
+  try {
+    return fs.existsSync(exportJobCacheAbsolutePath(job.artifact.cachePath));
+  } catch {
+    return false;
+  }
+}
+
+function exportJobIsStale(task, job) {
+  return Boolean(job?.sourceVersion) && job.sourceVersion !== task.contentVersion;
+}
+
+function sanitizeExportJob(task, job) {
+  const normalized = normalizePersistedExportJob(job);
+  return {
+    id: normalized.id,
+    format: normalized.format,
+    options: clone(normalized.options),
+    status: normalized.status,
+    progress: clone(normalized.progress),
+    createdAt: normalized.createdAt,
+    startedAt: normalized.startedAt,
+    finishedAt: normalized.finishedAt,
+    errorMessage: normalized.errorMessage || null,
+    filename: normalized.artifact?.filename || "",
+    mimeType: normalized.artifact?.mimeType || "",
+    sizeBytes: normalized.artifact?.sizeBytes || 0,
+    renderer: normalized.artifact?.renderer || "",
+    generatedAt: normalized.artifact?.generatedAt || "",
+    stale: exportJobIsStale(task, normalized),
+    canDownload: normalized.status === "completed" && !exportJobIsStale(task, normalized) && exportJobHasCache(normalized)
+  };
+}
+
+function artifactBufferFromArtifact(artifact) {
+  if (!artifact || typeof artifact !== "object") {
+    return Buffer.alloc(0);
+  }
+
+  if (artifact.encoding === "base64") {
+    return Buffer.from(artifact.content || "", "base64");
+  }
+
+  if (artifact.encoding === "json") {
+    return Buffer.from(JSON.stringify(artifact.content, null, 2), "utf8");
+  }
+
+  return Buffer.from(String(artifact.content ?? ""), "utf8");
+}
+
+function buildExportJobSignature(task, format, options = {}) {
+  return JSON.stringify({
+    format,
+    options,
+    contentVersion: task.contentVersion || ""
+  });
+}
+
+function formatOptionLabel(format, options = {}) {
+  if (format === "pdf" || format === "pdf_bilingual") {
+    return `PDF (${options.layout || "translation-only"})`;
+  }
+  if (format === "markdown_bilingual") {
+    return "Markdown (bilingual)";
+  }
+  if (format === "epub_bilingual") {
+    return "EPUB (bilingual)";
+  }
+  return format.toUpperCase();
+}
+
+function snapshotTaskForExport(task) {
+  return {
+    id: task.id,
+    filename: task.filename,
+    documentFormat: task.documentFormat,
+    sourceMarkdown: task.sourceMarkdown,
+    config: clone(task.config),
+    annotations: clone(task.annotations || []),
+    asset: clone(task.asset || null),
+    blocks: clone(task.blocks || [])
+  };
+}
+
+function updateExportJobProgress(task, job, patch = {}, options = {}) {
+  job.progress = {
+    ...job.progress,
+    ...normalizeExportJobProgress({
+      ...job.progress,
+      ...patch
+    })
+  };
+
+  refreshTask(task, {
+    touchUpdatedAt: false,
+    persist: options.persist !== false
+  });
+}
+
+async function removeTaskExportCache(taskId) {
+  const taskCacheDir = path.join(getExportCacheDir(), taskId);
+  await rmAsync(taskCacheDir, { recursive: true, force: true });
 }
 
 function createError(statusCode, code, message, details = null) {
@@ -462,7 +919,46 @@ function rebuildTextOnlyEpubFragment(sourceFragment, translatedText) {
   return match[1] + escapeXmlText(String(translatedText || "").trim()) + match[3];
 }
 
-function parseEpubTranslatedSegments(rawTranslation, expectedCount, providerLabel = "Provider") {
+function unwrapEpubSegmentPayload(payload) {
+  let current = payload;
+
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (typeof current === "string") {
+      const trimmed = current.trim();
+      if (!trimmed) {
+        return "";
+      }
+      try {
+        current = JSON.parse(trimmed);
+        continue;
+      } catch {
+        return trimmed;
+      }
+    }
+
+    if (current && typeof current === "object" && !Array.isArray(current)) {
+      const nestedCandidate =
+        current.translations ??
+        current.segments ??
+        current.items ??
+        current.result ??
+        current.results ??
+        current.data ??
+        current.values;
+
+      if (nestedCandidate !== undefined) {
+        current = nestedCandidate;
+        continue;
+      }
+    }
+
+    break;
+  }
+
+  return current;
+}
+
+export function parseEpubTranslatedSegments(rawTranslation, expectedCount, providerLabel = "Provider") {
   const cleaned = String(rawTranslation || "")
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
@@ -482,6 +978,8 @@ function parseEpubTranslatedSegments(rawTranslation, expectedCount, providerLabe
     }
     throw new Error(`${providerLabel} did not return valid JSON for EPUB segment translations.`);
   }
+
+  payload = unwrapEpubSegmentPayload(payload);
 
   if (!Array.isArray(payload)) {
     if (expectedCount === 1) {
@@ -516,11 +1014,180 @@ function parseEpubTranslatedSegments(rawTranslation, expectedCount, providerLabe
     return "";
   });
 
-  if (translations.length !== expectedCount || translations.some((value) => value === "")) {
+  if (translations.length !== expectedCount) {
     throw new Error(`${providerLabel} returned ${translations.length} EPUB segments, expected ${expectedCount}.`);
   }
 
+  const emptyIndex = translations.findIndex((value) => value === "");
+  if (emptyIndex >= 0) {
+    throw new Error(`${providerLabel} returned ${translations.length} EPUB segments, but segment ${emptyIndex + 1} was empty; expected ${expectedCount} non-empty segments.`);
+  }
+
   return translations;
+}
+
+function canAttemptEpubSegmentRepair(block, error) {
+  if (!block?.translationUnit?.segmentTemplate) {
+    return false;
+  }
+
+  const expectedCount = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments.length : 0;
+  if (expectedCount <= 1) {
+    return false;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /did not return valid JSON/i.test(message) ||
+    /must return a JSON array/i.test(message) ||
+    /returned \d+ EPUB segments/i.test(message) ||
+    /expected \d+ non-empty segments/i.test(message)
+  );
+}
+
+function getEpubPlaceholderPlan(block) {
+  return buildEpubPlaceholderPlan(block?.translationUnit, {
+    minimumMarkers: 1
+  });
+}
+
+function shouldUseEpubPlaceholderMode(block) {
+  const plan = getEpubPlaceholderPlan(block);
+  if (!plan) {
+    return false;
+  }
+  const inlineOrProtectedCount = plan.parts.filter((part) => part.type === "inline" || part.type === "keep").length;
+  return inlineOrProtectedCount > 0;
+}
+
+function canAttemptEpubPlaceholderRepair(block, error) {
+  if (!shouldUseEpubPlaceholderMode(block)) {
+    return false;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /EPUB placeholders/i.test(message) ||
+    /placeholder translation/i.test(message) ||
+    /inline placeholder/i.test(message)
+  );
+}
+
+async function repairMalformedEpubSegmentTranslation(task, block, rawTranslation, providerSettings, signal) {
+  const segments = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments : [];
+  const expectedCount = segments.length;
+
+  if (!expectedCount) {
+    throw new Error("No EPUB segments are available for repair.");
+  }
+
+  const repairPromptSnapshot = {
+    systemPrompt: "You repair malformed EPUB segment translation output. Return only a valid JSON array of translated strings.",
+    translationPrompt: [
+      "Repair the malformed EPUB segment translation output below.",
+      `Expected segment count: ${expectedCount}`,
+      "Requirements:",
+      `- Return only a JSON array with exactly ${expectedCount} translated strings.`,
+      "- Keep the same order as the source segments.",
+      "- Do not merge, omit, or wrap any segment.",
+      "- Remove any markdown fences, objects, or explanations.",
+      "- If the previous output merged multiple segments together, split it back to match the numbered source segments.",
+      "Source segments:",
+      ...segments.map((segment, index) => `${index + 1}. [${segment.kind}] ${segment.sourceText}`),
+      "Malformed model output:",
+      String(rawTranslation || "")
+    ].join("\n"),
+    retranslationPrompt: "",
+    rawPayload: {
+      blockId: block.id,
+      expectedCount
+    }
+  };
+
+  const repairResult = await translateWithDeepSeek({
+    provider: providerSettings,
+    promptSnapshot: repairPromptSnapshot,
+    signal
+  });
+
+  const repairedSegments = parseEpubTranslatedSegments(repairResult.translation, expectedCount, providerSettings.apiProvider || "Provider");
+  const applied = applyEpubTranslationUnit({
+    blockType: block.type,
+    sourceMarkdown: block.sourceMarkdown,
+    translationUnit: block.translationUnit,
+    translatedSegments: repairedSegments
+  });
+
+  return {
+    ...applied,
+    repairedTranslation: repairResult.translation
+  };
+}
+
+async function repairMalformedEpubPlaceholderTranslation(task, block, rawTranslation, providerSettings, signal) {
+  const plan = getEpubPlaceholderPlan(block);
+  if (!plan) {
+    throw new Error("No EPUB placeholder plan is available for repair.");
+  }
+
+  const expectedTokens = plan.placeholderTokens.join(" ");
+  const repairPromptSnapshot = {
+    systemPrompt: "You repair malformed EPUB placeholder translation output. Return only translated text with the exact placeholders preserved.",
+    translationPrompt: [
+      "Repair the malformed EPUB placeholder translation output below.",
+      "Requirements:",
+      "- Return only one translated text string.",
+      "- Preserve every placeholder token exactly as written.",
+      "- Keep placeholder order exactly the same.",
+      "- Do not add JSON, markdown fences, XML, comments, or explanations.",
+      "- Do not translate placeholder tokens.",
+      "Expected placeholders in order:",
+      expectedTokens,
+      "Source placeholder text:",
+      plan.sourceText,
+      "Malformed model output:",
+      String(rawTranslation || "")
+    ].join("\n"),
+    retranslationPrompt: "",
+    rawPayload: {
+      blockId: block.id,
+      placeholderCount: plan.placeholderTokens.length,
+      placeholders: plan.placeholderTokens
+    }
+  };
+
+  const repairResult = await translateWithDeepSeek({
+    provider: providerSettings,
+    promptSnapshot: repairPromptSnapshot,
+    signal
+  });
+
+  const applied = applyEpubPlaceholderTranslation({
+    blockType: block.type,
+    sourceMarkdown: block.sourceMarkdown,
+    translationUnit: block.translationUnit,
+    rawTranslation: repairResult.translation,
+    providerLabel: providerSettings.apiProvider || "Provider"
+  });
+
+  return {
+    ...applied,
+    repairedTranslation: repairResult.translation
+  };
+}
+
+function applyBestEffortEpubPlaceholderFallback(block, rawTranslation, providerLabel) {
+  if (!shouldUseEpubPlaceholderMode(block)) {
+    return null;
+  }
+
+  return applyEpubPlaceholderBestEffortTranslation({
+    blockType: block.type,
+    sourceMarkdown: block.sourceMarkdown,
+    translationUnit: block.translationUnit,
+    rawTranslation,
+    providerLabel
+  });
 }
 
 function buildEpubPromptSnapshot(task, block, overrides = {}) {
@@ -529,6 +1196,7 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
   const textOnly = Boolean(block.translationUnit?.textOnly);
   const segmentMapped = Boolean(block.translationUnit?.segmentMapped);
   const segments = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments : [];
+  const placeholderPlan = shouldUseEpubPlaceholderMode(block) ? getEpubPlaceholderPlan(block) : null;
   const values = {
     block_type: block.type,
     block_id: block.id,
@@ -560,7 +1228,31 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
         `Source text:`,
         sourceText
       ].join("\n")
-    : segmentMapped
+    : placeholderPlan
+      ? [
+          `Translate this EPUB placeholder text to Chinese.`,
+          `Block type: ${block.type}`,
+          `Block id: ${block.id}`,
+          `Document type: ${task.config.documentType}`,
+          `Style: ${task.config.style}`,
+          `Glossary:`,
+          task.config.glossary || "",
+          `Notes:`,
+          task.config.notes || "",
+          `Requirements:`,
+          `- Return only one translated text string.`,
+          `- Preserve every placeholder token exactly as written.`,
+          `- Keep placeholder token order exactly the same.`,
+          `- Do not add or remove placeholder tokens.`,
+          `- Do not translate placeholder tokens.`,
+          `- Do not add JSON, XML/HTML/XHTML tags, markdown fences, comments, or explanations.`,
+          `- Footnote/link placeholders such as [[MTS_KEEP_0001]] must remain unchanged.`,
+          `Expected placeholders in order:`,
+          placeholderPlan.placeholderTokens.join(" "),
+          `Source placeholder text:`,
+          placeholderPlan.sourceText
+        ].join("\n")
+      : segmentMapped
       ? [
           `Translate these EPUB text segments to Chinese.`,
           `Block type: ${block.type}`,
@@ -575,6 +1267,7 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
           `- Return only a JSON array of translated strings in the same order as the segments below.`,
           `- Do not return objects, markdown, code fences, XML, or explanations.`,
           `- Keep segment count exactly the same.`,
+          `- Example format: ["第1段", "第2段", "第3段"]`,
           `Block preview:`,
           block.sourceMarkdown,
           `Segments:`,
@@ -616,7 +1309,28 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
         `Source text:`,
         sourceText
       ].join("\n")
-    : segmentMapped
+    : placeholderPlan
+      ? [
+          `Retranslate this EPUB placeholder text to Chinese.`,
+          `Goal: ${values.retranslation_goal}`,
+          `Block type: ${block.type}`,
+          `Block id: ${block.id}`,
+          `Focus: ${values.focus}`,
+          `Current translation preview:`,
+          block.translatedMarkdown || "",
+          `Requirements:`,
+          `- Return only one translated text string.`,
+          `- Preserve every placeholder token exactly as written.`,
+          `- Keep placeholder token order exactly the same.`,
+          `- Do not add or remove placeholder tokens.`,
+          `- Do not translate placeholder tokens.`,
+          `- Do not add JSON, XML/HTML/XHTML tags, markdown fences, comments, or explanations.`,
+          `Expected placeholders in order:`,
+          placeholderPlan.placeholderTokens.join(" "),
+          `Source placeholder text:`,
+          placeholderPlan.sourceText
+        ].join("\n")
+      : segmentMapped
       ? [
           `Retranslate these EPUB text segments to Chinese.`,
           `Goal: ${values.retranslation_goal}`,
@@ -629,6 +1343,7 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
           `- Return only a JSON array of translated strings in the same order as the segments below.`,
           `- Keep segment count exactly the same.`,
           `- Do not return XML, markdown, or explanations.`,
+          `- Example format: ["第1段", "第2段", "第3段"]`,
           `Block preview:`,
           block.sourceMarkdown,
           `Segments:`,
@@ -650,19 +1365,31 @@ function buildEpubPromptSnapshot(task, block, overrides = {}) {
           sourceFragment
         ].join("\n");
 
+  const systemPrompt = placeholderPlan
+    ? "You are an EPUB translation engine. Translate the provided placeholder text into professional Simplified Chinese while preserving every [[MTS_*]] placeholder token exactly and in the same order. Return only the translated placeholder text."
+    : textOnly
+      ? "You are an EPUB translation engine. Translate visible EPUB text into professional Simplified Chinese. Return only translated plain text."
+      : segmentMapped
+        ? "You are an EPUB translation engine. Translate the provided EPUB text segments into professional Simplified Chinese. Return only a JSON array of translated strings with the exact same item count and order."
+        : EPUB_SYSTEM_PROMPT;
+
   return {
-    systemPrompt: EPUB_SYSTEM_PROMPT,
+    systemPrompt,
     translationPrompt,
     retranslationPrompt,
-    rawPayload: values
+    rawPayload: {
+      ...values,
+      epubMode: placeholderPlan ? "inline-placeholder" : (segmentMapped ? "segment-array" : (textOnly ? "text-only" : "xhtml-fragment")),
+      placeholderTokens: placeholderPlan?.placeholderTokens || []
+    }
   };
 }
 
-async function parseTaskInput({ taskId, filename, content, contentBase64, documentFormat }) {
+async function parseTaskInput({ taskId, filename, content, contentBase64, contentBuffer, documentFormat }) {
   const resolvedFormat = inferDocumentFormat(filename, documentFormat);
 
   if (resolvedFormat === "epub") {
-    const parsed = await parseEpubArchive({ taskId, contentBase64 });
+    const parsed = await parseEpubArchive({ taskId, contentBase64, contentBuffer });
     return {
       documentFormat: resolvedFormat,
       sourceMarkdown: parsed.sourcePreview || "",
@@ -724,6 +1451,9 @@ function normalizeParsedBlocks(blocks = []) {
 function sanitizeConfig(config) {
   const next = clone(stripSecretFields(config));
   const resolvedApiKey = getResolvedApiKey();
+  const resolvedAccessToken = getResolvedAccessToken();
+  next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
+  next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
 
   next.apiKey = "";
   next.hasApiKey = Boolean(resolvedApiKey.value);
@@ -735,10 +1465,29 @@ function sanitizeConfig(config) {
       ? "dotenv-file"
       : resolvedApiKey.source === "session"
         ? "memory-only"
-        : "none";
+        : resolvedApiKey.source === "env"
+          ? "environment"
+          : "none";
   next.apiKeyDotenvPath = DOTENV_PATH;
+  next.hasAccessToken = Boolean(resolvedAccessToken.value);
+  next.maskedAccessToken = maskSecret(resolvedAccessToken.value);
+  next.accessTokenSource = resolvedAccessToken.source;
+  next.accessTokenStorageKey = ["dotenv", "env"].includes(resolvedAccessToken.source) ? resolvedAccessToken.storageKey : "";
+  next.accessTokenPersistence =
+    resolvedAccessToken.source === "dotenv"
+      ? "dotenv-file"
+      : resolvedAccessToken.source === "session"
+        ? "memory-only"
+        : resolvedAccessToken.source === "env"
+          ? "environment"
+          : "none";
+  next.accessTokenDotenvPath = DOTENV_PATH;
+  next.authRequired = Boolean(resolvedAccessToken.value);
   next.apiKeyMutationGuard = "loopback-only";
+  next.accessTokenMutationGuard = "loopback-only";
   next.effectiveApiEndpoint = buildEffectiveApiEndpoint(next.apiBaseUrl);
+  next.publicApiBaseUrl = buildPublicApiBaseUrl(next.publicBaseUrl);
+  next.publicBasePath = extractPublicBasePath(next.publicBaseUrl);
 
   return next;
 }
@@ -759,8 +1508,10 @@ function sanitizeAsset(asset) {
 function buildTaskConfig(config = {}) {
   const merged = mergeSettings(stripSecretFields(appSettings), stripSecretFields(config));
   const resolvedApiKey = getResolvedApiKey();
+  const resolvedAccessToken = getResolvedAccessToken();
 
   merged.apiKey = "";
+  merged.accessToken = "";
   merged.hasApiKey = Boolean(resolvedApiKey.value);
   merged.maskedApiKey = maskSecret(resolvedApiKey.value);
   merged.apiKeySource = resolvedApiKey.source;
@@ -770,8 +1521,24 @@ function buildTaskConfig(config = {}) {
       ? "dotenv-file"
       : resolvedApiKey.source === "session"
         ? "memory-only"
-        : "none";
+        : resolvedApiKey.source === "env"
+          ? "environment"
+          : "none";
+  merged.hasAccessToken = Boolean(resolvedAccessToken.value);
+  merged.maskedAccessToken = maskSecret(resolvedAccessToken.value);
+  merged.accessTokenSource = resolvedAccessToken.source;
+  merged.accessTokenStorageKey = ["dotenv", "env"].includes(resolvedAccessToken.source) ? resolvedAccessToken.storageKey : "";
+  merged.accessTokenPersistence =
+    resolvedAccessToken.source === "dotenv"
+      ? "dotenv-file"
+      : resolvedAccessToken.source === "session"
+        ? "memory-only"
+        : resolvedAccessToken.source === "env"
+          ? "environment"
+          : "none";
   merged.apiKeyDotenvPath = DOTENV_PATH;
+  merged.accessTokenDotenvPath = DOTENV_PATH;
+  merged.authRequired = Boolean(resolvedAccessToken.value);
 
   return merged;
 }
@@ -780,11 +1547,11 @@ function getProviderSettings(task) {
   const resolvedApiKey = getResolvedApiKey();
 
   return {
-    apiProvider: appSettings.apiProvider,
+    apiProvider: task.config.apiProvider,
     apiKey: resolvedApiKey.value,
-    apiBaseUrl: appSettings.apiBaseUrl,
+    apiBaseUrl: task.config.apiBaseUrl,
     model: task.config.model,
-    requestTimeoutMs: appSettings.requestTimeoutMs
+    requestTimeoutMs: task.config.requestTimeoutMs
   };
 }
 
@@ -793,6 +1560,7 @@ function mergeSettings(currentSettings, patch = {}) {
   const stringFields = [
     "apiProvider",
     "apiBaseUrl",
+    "publicBaseUrl",
     "model",
     "sourceLanguage",
     "targetLanguage",
@@ -821,6 +1589,22 @@ function mergeSettings(currentSettings, patch = {}) {
     runtimeSecrets.apiKey = patch.apiKey.trim();
   }
 
+  if (patch.accessToken !== undefined) {
+    if (typeof patch.accessToken !== "string") {
+      throw createError(400, "invalid_request", "accessToken must be a string.");
+    }
+    runtimeSecrets.accessToken = patch.accessToken.trim();
+  }
+
+  const booleanFields = ["trustProxyHeaders"];
+  for (const field of booleanFields) {
+    if (patch[field] === undefined) continue;
+    if (typeof patch[field] !== "boolean") {
+      throw createError(400, "invalid_request", `${field} must be a boolean.`);
+    }
+    next[field] = patch[field];
+  }
+
   const numberFields = ["retries", "concurrency", "requestTimeoutMs"];
   for (const field of numberFields) {
     if (patch[field] === undefined) continue;
@@ -837,6 +1621,13 @@ function mergeSettings(currentSettings, patch = {}) {
   delete next.apiKeySource;
   delete next.apiKeyStorageKey;
   delete next.apiKeyPersistence;
+  delete next.hasAccessToken;
+  delete next.maskedAccessToken;
+  delete next.accessTokenSource;
+  delete next.accessTokenStorageKey;
+  delete next.accessTokenPersistence;
+  next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
+  next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
   return next;
 }
 
@@ -987,10 +1778,11 @@ function exportBaseName(filename) {
 
 function buildExports(task) {
   const baseName = exportBaseName(task.filename);
+  const exportLanguage = resolveExportLanguage(task?.config?.targetLanguage);
 
   return {
     markdown: {
-      filename: `${baseName}.zh-CN.md`,
+      filename: `${baseName}.${exportLanguage.suffix}.md`,
       mimeType: "text/markdown; charset=utf-8",
       encoding: "utf8",
       content: mergeMarkdown(task.blocks, 'target_only')
@@ -1060,6 +1852,14 @@ function normalizeExportOptions(format, options = {}) {
     normalized.layout = "bilingual";
   }
 
+  if (format === "epub") {
+    normalized.layout = "translation-only";
+  }
+
+  if (format === "epub_bilingual") {
+    normalized.layout = "bilingual";
+  }
+
   return normalized;
 }
 
@@ -1100,13 +1900,16 @@ function refreshTask(task, options = {}) {
     rebuildPromptSnapshots: options.rebuildPromptSnapshots === true,
     rebuildExports: options.rebuildExports === true
   });
-  saveState();
+  if (options.persist !== false) {
+    saveState();
+  }
 }
 
 function sanitizeTask(task) {
   const next = clone(task);
   next.config = sanitizeConfig(task.config);
   next.asset = sanitizeAsset(task.asset);
+  next.exportJobs = ensureTaskExportJobs(task).map((job) => sanitizeExportJob(task, job));
   return next;
 }
 
@@ -1121,7 +1924,8 @@ function summarizeTask(task) {
     stage: task.summary.stage,
     parser: task.parser,
     stats: task.stats,
-    summary: task.summary
+    summary: task.summary,
+    exportJobs: ensureTaskExportJobs(task).map((job) => sanitizeExportJob(task, job))
   };
 }
 
@@ -1367,6 +2171,16 @@ function applyEpubTranslationResult(task, block, rawTranslation, providerLabel, 
   const segmentCount = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments.length : 0;
 
   if (block.translationUnit?.segmentTemplate && segmentCount > 0) {
+    if (shouldUseEpubPlaceholderMode(block) && (!options.allowBestEffortFallback || String(rawTranslation || "").includes("[[MTS_"))) {
+      return applyEpubPlaceholderTranslation({
+        blockType: block.type,
+        sourceMarkdown: block.sourceMarkdown,
+        translationUnit: block.translationUnit,
+        rawTranslation,
+        providerLabel
+      });
+    }
+
     const translatedSegments = parseEpubTranslatedSegments(rawTranslation, segmentCount, providerLabel);
     return applyEpubTranslationUnit({
       blockType: block.type,
@@ -1400,10 +2214,13 @@ function scheduleBlockTranslation(task, block, options = {}) {
   clearBlockAbortControllers(task.id, block.id);
 
   block.status = "translating";
+  block.reviewCandidateTranslation = "";
+  block.reviewErrorMessage = "";
   markSessionStart(task);
-  refreshTask(task);
+  refreshTask(task, { persist: false });
 
   void (async () => {
+    let candidateTranslation = "";
     try {
       const promptSnapshot = buildPromptSnapshot(task, block, {
         retranslationGoal: options.retranslationGoal,
@@ -1422,22 +2239,61 @@ function scheduleBlockTranslation(task, block, options = {}) {
         signal: providerController.signal
       });
       const translation = providerResult.translation;
-      const candidateTranslation = typeof translation === "string" ? translation : "";
+      candidateTranslation = typeof translation === "string" ? translation : "";
 
       if (!externallyStoppedStatus(block)) {
         let nextTranslatedMarkdown = translation;
         let translatedFragment = null;
         let structureSignature = null;
+        let reviewCandidateTranslation = candidateTranslation;
+        let repairedMalformedOutput = false;
 
         if (task.documentFormat === "epub") {
-          const applied = applyEpubTranslationResult(task, block, translation, providerLabel);
-          translatedFragment = applied.normalizedFragment;
-          structureSignature = applied.structureSignature;
-          nextTranslatedMarkdown = applied.previewText;
+          try {
+            const applied = applyEpubTranslationResult(task, block, translation, providerLabel);
+            translatedFragment = applied.normalizedFragment;
+            structureSignature = applied.structureSignature;
+            nextTranslatedMarkdown = applied.previewText;
+          } catch (error) {
+            const repairFn = canAttemptEpubPlaceholderRepair(block, error)
+              ? repairMalformedEpubPlaceholderTranslation
+              : (canAttemptEpubSegmentRepair(block, error) ? repairMalformedEpubSegmentTranslation : null);
+
+            if (!repairFn) {
+              if (candidateTranslation.trim()) {
+                error.rawCandidateTranslation = candidateTranslation.trim();
+              }
+              throw error;
+            }
+
+            try {
+              const repaired = await repairFn(task, block, translation, providerSettings, providerController.signal);
+              translatedFragment = repaired.normalizedFragment;
+              structureSignature = repaired.structureSignature;
+              nextTranslatedMarkdown = repaired.previewText;
+              reviewCandidateTranslation = String(repaired.repairedTranslation || candidateTranslation).trim();
+              repairedMalformedOutput = true;
+            } catch (repairError) {
+              const fallback = applyBestEffortEpubPlaceholderFallback(block, translation, providerLabel);
+              if (fallback) {
+                translatedFragment = fallback.normalizedFragment;
+                structureSignature = fallback.structureSignature;
+                nextTranslatedMarkdown = fallback.previewText;
+                reviewCandidateTranslation = "";
+                repairedMalformedOutput = true;
+              } else {
+                const combinedError = new Error(`${error instanceof Error ? error.message : String(error)} Automatic repair also failed: ${repairError instanceof Error ? repairError.message : String(repairError)}`);
+                if (candidateTranslation.trim()) {
+                  combinedError.rawCandidateTranslation = candidateTranslation.trim();
+                }
+                throw combinedError;
+              }
+            }
+          }
         }
 
         if (!externallyStoppedStatus(block)) {
-          block.reviewCandidateTranslation = candidateTranslation;
+          block.reviewCandidateTranslation = reviewCandidateTranslation;
           if (task.documentFormat === "epub") {
             if (block.translationUnit && translatedFragment !== null) {
               block.translationUnit.translatedFragment = translatedFragment;
@@ -1456,11 +2312,12 @@ function scheduleBlockTranslation(task, block, options = {}) {
           block.reviewState = "none";
           block.reviewErrorMessage = "";
           block.errorMessage = "";
+          markTaskContentChanged(task);
           addActivity(
             task,
             options.retranslationGoal ? "block_retranslated" : "block_translated",
             options.retranslationGoal ? "Block retranslated" : "Block translated",
-            `${block.id} finished ${options.retranslationGoal ? "retranslation" : "translation"} via ${providerLabel} API.`
+            `${block.id} finished ${options.retranslationGoal ? "retranslation" : "translation"} via ${providerLabel} API${repairedMalformedOutput ? " after automatic EPUB output repair" : ""}.`
           );
         }
       }
@@ -1470,7 +2327,11 @@ function scheduleBlockTranslation(task, block, options = {}) {
         block.failureCount += 1;
         block.errorMessage = error instanceof Error ? error.message : String(error);
         block.reviewErrorMessage = block.errorMessage;
-        block.reviewState = block.reviewCandidateTranslation ? "pending_confirmation" : "none";
+        const rawCandidateTranslation =
+          (typeof error?.rawCandidateTranslation === "string" && error.rawCandidateTranslation.trim()) ||
+          candidateTranslation.trim();
+        block.reviewCandidateTranslation = rawCandidateTranslation;
+        block.reviewState = "none";
         addActivity(task, "block_failed", "Block translation failed", `${block.id} failed: ${block.errorMessage}`);
       } else {
         block.errorMessage = "";
@@ -1486,13 +2347,14 @@ function scheduleBlockTranslation(task, block, options = {}) {
   })();
 }
 
-async function createTaskRecord({ filename, content, contentBase64, documentFormat, config = {}, source = "api" }) {
+async function createTaskRecord({ filename, content, contentBase64, contentBuffer, documentFormat, config = {}, source = "api" }) {
   const taskId = randomUUID();
   const parsed = await parseTaskInput({
     taskId,
     filename,
     content,
     contentBase64,
+    contentBuffer,
     documentFormat
   });
 
@@ -1517,6 +2379,8 @@ async function createTaskRecord({ filename, content, contentBase64, documentForm
     activity: [],
     summary: null,
     exports: {},
+    exportJobs: [],
+    contentVersion: now(),
     runtime: {
       sessionStartedAt: ""
     }
@@ -1597,8 +2461,10 @@ async function reparseIntoTask(task, payload = {}) {
   task.asset = parsed.asset;
   task.annotations = [];
   task.comments = [];
+  task.exportJobs = [];
   task.runtime.sessionStartedAt = "";
   task.runtime.pendingQueue = [];
+  markTaskContentChanged(task);
 
   addActivity(task, "task_reparsed", "Task reparsed", `${task.filename} was reparsed and block mappings were rebuilt.`);
   refreshTask(task);
@@ -1616,13 +2482,28 @@ function validateAnnotation(annotation) {
   }
 }
 
-export function getServiceOverview(origin) {
+export function getServiceOverview(context = {}) {
+  const accessToken = getResolvedAccessToken();
+  const publicBaseUrl =
+    typeof context === "string"
+      ? context
+      : normalizePublicBaseUrl(context.publicBaseUrl || "");
+  const basePath =
+    typeof context === "string"
+      ? ""
+      : normalizeBasePath(context.basePath || extractPublicBasePath(publicBaseUrl));
+  const docsPath = `${basePath}/api/docs` || "/api/docs";
+  const openApiPath = `${basePath}/openapi.yaml` || "/openapi.yaml";
+  const healthPath = `${basePath}/health` || "/health";
+
   return {
     service: SERVICE_INFO,
-    baseUrl: `${origin}/api`,
-    docsPath: "/api/docs",
-    openApiPath: "/openapi.yaml",
-    healthPath: "/health"
+    publicBaseUrl,
+    baseUrl: publicBaseUrl ? `${publicBaseUrl}/api` : "",
+    authRequired: Boolean(accessToken.value),
+    docsPath,
+    openApiPath,
+    healthPath
   };
 }
 
@@ -1665,6 +2546,27 @@ export function updateSettings(patch = {}) {
   return getSettings();
 }
 
+export function getResolvedAccessTokenState() {
+  return getResolvedAccessToken();
+}
+
+export function persistAccessTokenToDotenv(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw createError(400, "invalid_request", "Request body must be an object.");
+  }
+
+  const accessToken = requireNonEmptyString(payload.accessToken, "accessToken");
+  writeManagedAccessTokenToDotenv(accessToken);
+  runtimeSecrets.accessToken = "";
+
+  const persistedValue = getDotenvAccessToken().value;
+  if (persistedValue !== accessToken) {
+    throw createError(500, "dotenv_persist_failed", "Failed to persist access token to the local .env file.");
+  }
+
+  return getSettings();
+}
+
 export function persistApiKeyToDotenv(payload = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw createError(400, "invalid_request", "Request body must be an object.");
@@ -1702,6 +2604,26 @@ export function clearApiKey(payload = {}) {
   return getSettings();
 }
 
+export function clearAccessToken(payload = {}) {
+  const options = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const rawScope = options.scope === undefined ? "all" : requireNonEmptyString(options.scope, "scope").toLowerCase();
+  const scope = rawScope === "env" ? "dotenv" : rawScope;
+
+  if (!["session", "dotenv", "all"].includes(scope)) {
+    throw createError(400, "invalid_request", 'scope must be one of session, dotenv, all.');
+  }
+
+  if (scope === "session" || scope === "all") {
+    runtimeSecrets.accessToken = "";
+  }
+
+  if (scope === "dotenv" || scope === "all") {
+    clearManagedAccessTokenFromDotenv();
+  }
+
+  return getSettings();
+}
+
 export async function createTask(input = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw createError(400, "invalid_request", "Request body must be an object.");
@@ -1718,6 +2640,7 @@ export async function createTask(input = {}) {
     filename,
     content: input.content,
     contentBase64: input.contentBase64,
+    contentBuffer: input.contentBuffer,
     documentFormat: input.documentFormat,
     config
   }));
@@ -1772,13 +2695,39 @@ function serializeTaskStatusBlock(block) {
   };
 }
 
+function getSerializedTranslatedMarkdown(block) {
+  const storedTranslation = block.translatedMarkdown || "";
+  const translatedFragment = block.translationUnit?.translatedFragment || "";
+  if (translatedFragment && /<br\b/i.test(translatedFragment)) {
+    try {
+      return buildEpubPreviewFromNormalizedFragment(block.type, translatedFragment) || storedTranslation;
+    } catch {
+      return storedTranslation;
+    }
+  }
+  return storedTranslation;
+}
+
+function getSerializedSourceMarkdown(block) {
+  const storedSource = block.sourceMarkdown || "";
+  const sourceFragment = block.translationUnit?.sourceFragment || "";
+  if (sourceFragment && /<br\b/i.test(sourceFragment)) {
+    try {
+      return buildEpubPreviewFromNormalizedFragment(block.type, sourceFragment) || storedSource;
+    } catch {
+      return storedSource;
+    }
+  }
+  return storedSource;
+}
+
 function serializeTaskPageBlock(block) {
   return {
     ...serializeTaskStatusBlock(block),
     order: block.order,
     headingPath: clone(block.headingPath || []),
-    sourceMarkdown: block.sourceMarkdown,
-    translatedMarkdown: block.translatedMarkdown || "",
+    sourceMarkdown: getSerializedSourceMarkdown(block),
+    translatedMarkdown: getSerializedTranslatedMarkdown(block),
     tokenEstimate: block.tokenEstimate,
     skipReason: block.skipReason || ""
   };
@@ -1810,6 +2759,13 @@ export function getTaskStatus(taskId, options = {}) {
   const pageStart = requestedPageSize === "all" ? 0 : (page - 1) * normalizedPageSize;
   const pageEnd = requestedPageSize === "all" ? totalBlocks : Math.min(totalBlocks, pageStart + normalizedPageSize);
   const pageBlocks = task.blocks.slice(pageStart, pageEnd);
+  const includeBlocks = options.includeBlocks === true;
+  const failedBlocks = task.blocks
+    .filter((block) => block.status === "failed")
+    .map((block) => ({
+      id: block.id,
+      order: block.order
+    }));
 
   return {
     taskId: task.id,
@@ -1823,7 +2779,9 @@ export function getTaskStatus(taskId, options = {}) {
     pageSize: normalizedPageSize,
     totalPages,
     totalBlocks,
-    blocks: task.blocks.map(serializeTaskStatusBlock),
+    failedBlocks,
+    exportJobs: ensureTaskExportJobs(task).map((job) => sanitizeExportJob(task, job)),
+    blocks: includeBlocks ? task.blocks.map(serializeTaskStatusBlock) : undefined,
     pageBlocks: pageBlocks.map(serializeTaskPageBlock)
   };
 }
@@ -1931,6 +2889,7 @@ export async function deleteTask(taskId) {
   clearTaskAbortControllers(taskId);
   tasks.delete(taskId);
   await removeTaskArtifacts(task);
+  await removeTaskExportCache(taskId);
   saveState();
 
   return {
@@ -2082,6 +3041,7 @@ export async function updateBlock(taskId, blockId, patch = {}) {
       block.reviewErrorMessage = "";
       block.reviewState = "confirmed";
       block.lastEditedAt = now();
+      markTaskContentChanged(task);
       addActivity(task, "block_review_confirmed", "Block confirmed", `${block.id} review candidate was confirmed (${confirmationMode}).`);
       changed = true;
     } else if (patch.reviewState === "ignored") {
@@ -2105,6 +3065,7 @@ export async function updateBlock(taskId, blockId, patch = {}) {
     block.reviewErrorMessage = "";
     block.reviewState = "confirmed";
     block.lastEditedAt = now();
+    markTaskContentChanged(task);
     changed = true;
   }
 
@@ -2157,6 +3118,287 @@ export function addAnnotation(taskId, blockId, annotationInput) {
   return sanitizeTask(task);
 }
 
+function ensureExportJob(task, jobId) {
+  const job = ensureTaskExportJobs(task).find((candidate) => candidate.id === jobId);
+  if (!job) {
+    throw createError(404, "export_job_not_found", `Export job ${jobId} was not found.`);
+  }
+  return job;
+}
+
+function createExportJobRecord(task, format, normalizedOptions) {
+  const signature = buildExportJobSignature(task, format, normalizedOptions);
+  return {
+    id: randomUUID(),
+    format,
+    options: clone(normalizedOptions),
+    signature,
+    sourceVersion: task.contentVersion || now(),
+    status: "queued",
+    progress: normalizeExportJobProgress({
+      percent: 0,
+      stage: "queued",
+      detail: "Waiting to start export.",
+      currentStep: 0,
+      totalSteps: 4
+    }),
+    createdAt: now(),
+    startedAt: "",
+    finishedAt: "",
+    errorMessage: "",
+    artifact: null
+  };
+}
+
+function findReusableExportJob(task, signature) {
+  return ensureTaskExportJobs(task).find((job) =>
+    job.signature === signature
+      && !exportJobIsStale(task, job)
+      && (
+        job.status === "queued"
+          || job.status === "running"
+          || (job.status === "completed" && exportJobHasCache(job))
+      )
+  ) || null;
+}
+
+async function persistArtifactToCache(taskId, job, artifact) {
+  const extension = path.extname(artifact.filename || "") || "";
+  const taskCacheDir = path.join(getExportCacheDir(), taskId);
+  const absolutePath = path.join(taskCacheDir, `${job.id}${extension}`);
+  fs.mkdirSync(taskCacheDir, { recursive: true });
+  await writeFileAsync(absolutePath, artifactBufferFromArtifact(artifact));
+
+  return {
+    filename: artifact.filename,
+    mimeType: artifact.mimeType,
+    sizeBytes: Number(artifact.sizeBytes || fs.statSync(absolutePath).size || 0),
+    cachePath: path.relative(ROOT_DIR, absolutePath),
+    renderer: artifact.renderer || "",
+    generatedAt: artifact.generatedAt || now()
+  };
+}
+
+function createProgressPulse(task, job, targetPercent, detail) {
+  let currentPercent = job.progress.percent;
+  job.progress.detail = detail;
+  return setInterval(() => {
+    if (job.status !== "running") {
+      return;
+    }
+
+    currentPercent = Math.min(targetPercent, currentPercent + 3);
+    if (currentPercent <= job.progress.percent) {
+      return;
+    }
+
+    updateExportJobProgress(task, job, {
+      percent: currentPercent,
+      stage: "rendering",
+      detail
+    });
+  }, 2000);
+}
+
+async function buildArtifactForJob(taskSnapshot, format, normalizedOptions, internalOptions = {}) {
+  if (format === "pdf" || format === "pdf_bilingual") {
+    return buildPdfExport(taskSnapshot, {
+      ...normalizedOptions,
+      ...internalOptions
+    });
+  }
+
+  if (format === "epub" || format === "epub_bilingual") {
+    if (taskSnapshot.documentFormat !== "epub") {
+      throw createError(409, "export_not_supported", "EPUB export is only available for EPUB tasks.");
+    }
+    return buildEpubExport(taskSnapshot, normalizedOptions);
+  }
+
+  return clone(buildExports(taskSnapshot)[format]);
+}
+
+async function runExportJob(taskId, jobId) {
+  const task = tasks.get(taskId);
+  if (!task) {
+    return;
+  }
+
+  const job = ensureTaskExportJobs(task).find((candidate) => candidate.id === jobId);
+  if (!job || job.status !== "queued") {
+    return;
+  }
+
+  let pulse = null;
+  try {
+    job.status = "running";
+    job.startedAt = now();
+    updateExportJobProgress(task, job, {
+      percent: 8,
+      stage: "preparing",
+      detail: "Preparing export snapshot.",
+      currentStep: 1,
+      totalSteps: 4
+    });
+
+    const taskSnapshot = snapshotTaskForExport(task);
+    updateExportJobProgress(task, job, {
+      percent: 18,
+      stage: "rendering",
+      detail: "Rendering export artifact.",
+      currentStep: 2,
+      totalSteps: 4
+    });
+
+    const progressReporter =
+      job.format === "pdf" || job.format === "pdf_bilingual"
+        ? (patch = {}) => updateExportJobProgress(task, job, patch, { persist: false })
+        : null;
+
+    if (job.format === "epub" || job.format === "epub_bilingual") {
+      pulse = createProgressPulse(
+        task,
+        job,
+        84,
+        job.format === "epub_bilingual" ? "Packaging bilingual EPUB export." : "Packaging EPUB export."
+      );
+    }
+
+    const artifact = await buildArtifactForJob(taskSnapshot, job.format, job.options || {}, {
+      onProgress: progressReporter
+    });
+    if (pulse) {
+      clearInterval(pulse);
+      pulse = null;
+    }
+
+    updateExportJobProgress(task, job, {
+      percent: 90,
+      stage: "caching",
+      detail: "Writing export to cache.",
+      currentStep: 3,
+      totalSteps: 4
+    });
+
+    job.artifact = await persistArtifactToCache(taskId, job, artifact);
+    job.status = "completed";
+    job.finishedAt = now();
+    job.errorMessage = "";
+    updateExportJobProgress(task, job, {
+      percent: 100,
+      stage: "completed",
+      detail: "Export is ready to download.",
+      currentStep: 4,
+      totalSteps: 4
+    });
+
+    addActivity(task, "task_exported", "Task exported", `${task.filename} finished async export as ${formatOptionLabel(job.format, job.options)}.`);
+    refreshTask(task, { touchUpdatedAt: false });
+  } catch (error) {
+    if (pulse) {
+      clearInterval(pulse);
+    }
+    job.status = "failed";
+    job.finishedAt = now();
+    job.errorMessage = error instanceof Error ? error.message : String(error);
+    updateExportJobProgress(task, job, {
+      percent: Math.max(job.progress.percent, 100),
+      stage: "failed",
+      detail: job.errorMessage,
+      currentStep: 4,
+      totalSteps: 4
+    });
+    addActivity(task, "task_export_failed", "Task export failed", `${task.filename} export failed: ${job.errorMessage}`);
+    refreshTask(task, { touchUpdatedAt: false });
+  }
+}
+
+export function createExportJob(taskId, payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw createError(400, "invalid_request", "Request body must be an object.");
+  }
+
+  const format = requireNonEmptyString(payload.format, "format");
+  if (!EXPORT_FORMATS.includes(format)) {
+    throw createError(400, "invalid_request", `format must be one of ${EXPORT_FORMATS.join(", ")}.`);
+  }
+
+  const task = ensureTask(taskId);
+  syncTaskReadModel(task, {
+    touchUpdatedAt: false,
+    rebuildPromptSnapshots: false,
+    rebuildExports: false
+  });
+  const normalizedOptions = normalizeExportOptions(format, payload);
+  const signature = buildExportJobSignature(task, format, normalizedOptions);
+  const reusableJob = findReusableExportJob(task, signature);
+
+  if (reusableJob) {
+    return {
+      taskId: task.id,
+      filename: task.filename,
+      job: sanitizeExportJob(task, reusableJob)
+    };
+  }
+
+  const job = createExportJobRecord(task, format, normalizedOptions);
+  const exportJobs = ensureTaskExportJobs(task);
+  exportJobs.unshift(job);
+  task.exportJobs = exportJobs.slice(0, 12);
+  addActivity(task, "task_export_queued", "Task export queued", `${task.filename} queued async export as ${formatOptionLabel(format, normalizedOptions)}.`);
+  refreshTask(task, { touchUpdatedAt: false });
+  setTimeout(() => {
+    void runExportJob(task.id, job.id);
+  }, 0);
+
+  return {
+    taskId: task.id,
+    filename: task.filename,
+    job: sanitizeExportJob(task, job)
+  };
+}
+
+export function getExportJob(taskId, jobId) {
+  const task = ensureTask(taskId);
+  syncTaskReadModel(task, {
+    touchUpdatedAt: false,
+    rebuildPromptSnapshots: false,
+    rebuildExports: false
+  });
+  const job = ensureExportJob(task, jobId);
+  return {
+    taskId: task.id,
+    filename: task.filename,
+    job: sanitizeExportJob(task, job)
+  };
+}
+
+export async function readExportJobArtifact(taskId, jobId) {
+  const task = ensureTask(taskId);
+  const job = ensureExportJob(task, jobId);
+
+  if (job.status !== "completed" || !job.artifact?.cachePath) {
+    throw createError(409, "export_job_not_ready", "Export job is not ready to download yet.");
+  }
+
+  if (exportJobIsStale(task, job)) {
+    throw createError(409, "export_job_stale", "This cached export is stale because the task content changed. Create a new export job.");
+  }
+
+  if (!exportJobHasCache(job)) {
+    throw createError(404, "export_cache_missing", "The cached export file is no longer available.");
+  }
+
+  const payload = await readFileAsync(exportJobCacheAbsolutePath(job.artifact.cachePath));
+  return {
+    taskId: task.id,
+    jobId: job.id,
+    filename: job.artifact.filename,
+    mimeType: job.artifact.mimeType,
+    payload
+  };
+}
+
 export async function exportTask(taskId, format, options = {}) {
   if (!EXPORT_FORMATS.includes(format)) {
     throw createError(400, "invalid_request", `format must be one of ${EXPORT_FORMATS.join(", ")}.`);
@@ -2173,11 +3415,11 @@ export async function exportTask(taskId, format, options = {}) {
   let artifact = null;
   if (format === "pdf" || format === "pdf_bilingual") {
     artifact = await buildPdfExport(task, normalizedOptions);
-  } else if (format === "epub") {
+  } else if (format === "epub" || format === "epub_bilingual") {
     if (task.documentFormat !== "epub") {
       throw createError(409, "export_not_supported", "EPUB export is only available for EPUB tasks.");
     }
-    artifact = await buildEpubExport(task);
+    artifact = await buildEpubExport(task, normalizedOptions);
   } else {
     artifact = clone(buildExports(task)[format]);
   }
@@ -2188,8 +3430,8 @@ export async function exportTask(taskId, format, options = {}) {
     "Task exported",
     format === "pdf" || format === "pdf_bilingual"
       ? `${task.filename} was exported as PDF (${normalizedOptions.layout}).`
-      : format === "epub"
-        ? `${task.filename} was exported as EPUB.`
+      : format === "epub" || format === "epub_bilingual"
+        ? `${task.filename} was exported as EPUB (${normalizedOptions.layout}).`
         : `${task.filename} was exported as ${format}.`
   );
   refreshTask(task);
@@ -2209,35 +3451,10 @@ export function clearAllState() {
     clearTaskTimers(taskId);
   }
   tasks.clear();
+  fs.rmSync(getExportCacheDir(), { recursive: true, force: true });
+  resolvedExportCacheDir = "";
   runtimeSecrets.apiKey = "";
+  runtimeSecrets.accessToken = "";
   appSettings = structuredClone(DEFAULT_SETTINGS);
+  pendingStateSanitize = false;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

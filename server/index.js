@@ -1,4 +1,5 @@
-﻿import { createServer } from "node:http";
+﻿import { existsSync } from "node:fs";
+import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,19 +7,25 @@ import {
   addAnnotation,
   cancelTask,
   clearApiKey,
+  clearAccessToken,
+  createExportJob,
   createTask,
   deleteTask,
   exportTask,
   flushState,
   getBlock,
+  getExportJob,
   getBlockPrompt,
   getServiceOverview,
   getSettings,
+  getResolvedAccessTokenState,
   getTask,
   getTaskStatus,
   listTasks,
   pauseTask,
   persistApiKeyToDotenv,
+  persistAccessTokenToDotenv,
+  readExportJobArtifact,
   testProviderConnection,
   resumeTask,
   reparseTask,
@@ -36,9 +43,41 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const openApiFilePath = path.join(rootDir, "docs", "openapi.yaml");
+const webDistDir = path.join(rootDir, "web", "dist");
+const webIndexFilePath = path.join(webDistDir, "index.html");
 const port = Number(process.env.PORT || 8787);
 const startedAt = Date.now();
 let nextRequestId = 1;
+const FRONTEND_MIME_TYPES = new Map([
+  [".html", "text/html; charset=utf-8"],
+  [".js", "application/javascript; charset=utf-8"],
+  [".css", "text/css; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".ico", "image/x-icon"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+  [".ttf", "font/ttf"],
+  [".map", "application/json; charset=utf-8"]
+]);
+const CORS_ALLOW_HEADERS = "Content-Type, Authorization, X-Access-Token";
+const CORS_ALLOW_METHODS = "GET,POST,PUT,PATCH,DELETE,OPTIONS";
+const CORS_EXPOSE_HEADERS = "Content-Disposition";
+
+function buildContentDisposition(filename = "download.bin") {
+  const raw = String(filename || "download.bin");
+  const asciiFallback = raw
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7E]+/g, "_")
+    .replace(/["\\]/g, "_")
+    .trim() || "download.bin";
+  const encoded = encodeURIComponent(raw);
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
 
 function formatLogValue(value) {
   if (value === undefined || value === null || value === "") {
@@ -66,11 +105,121 @@ function uptimeSeconds() {
   return Math.round((Date.now() - startedAt) / 1000);
 }
 
-function originOf(request) {
-  const forwardedProto = request.headers["x-forwarded-proto"];
-  const proto = typeof forwardedProto === "string" ? forwardedProto.split(",")[0].trim() : "http";
+function requestOrigin(request) {
+  const proto = request.socket.encrypted ? "https" : "http";
   const host = request.headers.host || `localhost:${port}`;
   return `${proto}://${host}`;
+}
+
+function firstHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return firstHeaderValue(value[0]);
+  }
+
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.split(",")[0].trim();
+}
+
+function normalizeBasePath(value = "") {
+  const trimmed = String(value || "").trim();
+  if (!trimmed || trimmed === "/") {
+    return "";
+  }
+
+  const normalized = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return normalized.replace(/\/+$/, "") || "";
+}
+
+function normalizePublicBaseUrl(value = "") {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    parsed.search = "";
+    parsed.hash = "";
+    const basePath = normalizeBasePath(parsed.pathname);
+    parsed.pathname = basePath || "/";
+    return basePath ? `${parsed.origin}${basePath}` : parsed.origin;
+  } catch {
+    return "";
+  }
+}
+
+function extractBasePath(publicBaseUrl = "") {
+  if (!publicBaseUrl) {
+    return "";
+  }
+
+  try {
+    return normalizeBasePath(new URL(publicBaseUrl).pathname);
+  } catch {
+    return "";
+  }
+}
+
+function stripBasePath(pathname, basePath) {
+  if (!basePath) {
+    return pathname || "/";
+  }
+
+  if (pathname === basePath) {
+    return "/";
+  }
+
+  if (pathname.startsWith(`${basePath}/`)) {
+    return pathname.slice(basePath.length) || "/";
+  }
+
+  return pathname || "/";
+}
+
+function resolveRuntimeConfig(request) {
+  const settings = getSettings();
+  const configuredPublicBaseUrl = normalizePublicBaseUrl(settings.publicBaseUrl);
+
+  if (configuredPublicBaseUrl) {
+    const basePath = extractBasePath(configuredPublicBaseUrl);
+    return {
+      trustProxyHeaders: Boolean(settings.trustProxyHeaders),
+      publicBaseUrl: configuredPublicBaseUrl,
+      basePath,
+      apiBasePath: `${basePath}/api` || "/api"
+    };
+  }
+
+  const trustProxyHeaders = Boolean(settings.trustProxyHeaders);
+  const forwardedProto = trustProxyHeaders ? firstHeaderValue(request.headers["x-forwarded-proto"]) : "";
+  const forwardedHost = trustProxyHeaders ? firstHeaderValue(request.headers["x-forwarded-host"]) : "";
+  const forwardedPrefix = trustProxyHeaders ? normalizeBasePath(firstHeaderValue(request.headers["x-forwarded-prefix"])) : "";
+
+  const proto = forwardedProto || (request.socket.encrypted ? "https" : "http");
+  const host = forwardedHost || request.headers.host || `localhost:${port}`;
+  const publicBaseUrl = `${proto}://${host}${forwardedPrefix}`;
+
+  return {
+    trustProxyHeaders,
+    publicBaseUrl,
+    basePath: forwardedPrefix,
+    apiBasePath: `${forwardedPrefix}/api` || "/api"
+  };
+}
+
+function buildRequestContext(request) {
+  const rawUrl = new URL(request.url, requestOrigin(request));
+  const runtime = resolveRuntimeConfig(request);
+  const pathname = stripBasePath(rawUrl.pathname, runtime.basePath);
+
+  return {
+    rawUrl,
+    pathname,
+    runtime
+  };
 }
 
 function isLoopbackRequest(request) {
@@ -87,12 +236,48 @@ function assertLocalSecretMutation(request) {
   }
 }
 
+function presentedAccessTokenOf(request) {
+  const authorization = firstHeaderValue(request.headers.authorization);
+  if (authorization && /^bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^bearer\s+/i, "").trim();
+  }
+
+  const tokenHeader = firstHeaderValue(request.headers["x-access-token"]);
+  return tokenHeader || "";
+}
+
+function requiresApiAuthorization(pathname) {
+  if (!pathname.startsWith("/api")) {
+    return false;
+  }
+
+  return !["/api", "/api/docs", "/api/openapi.yaml"].includes(pathname);
+}
+
+function assertAuthorizedApiRequest(request, pathname) {
+  const expectedToken = getResolvedAccessTokenState().value;
+  if (!expectedToken || !requiresApiAuthorization(pathname)) {
+    return;
+  }
+
+  const presentedToken = presentedAccessTokenOf(request);
+  if (presentedToken === expectedToken) {
+    return;
+  }
+
+  const error = new Error("A valid access token is required for this API.");
+  error.statusCode = 401;
+  error.code = "unauthorized";
+  throw error;
+}
+
 function writeJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": CORS_EXPOSE_HEADERS
   });
   response.end(JSON.stringify(payload, null, 2));
 }
@@ -101,8 +286,9 @@ function writeText(response, statusCode, payload, contentType = "text/plain; cha
   response.writeHead(statusCode, {
     "Content-Type": contentType,
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": CORS_EXPOSE_HEADERS
   });
   response.end(payload);
 }
@@ -111,10 +297,23 @@ function writeBinary(response, statusCode, payload, contentType, filename) {
   response.writeHead(statusCode, {
     "Content-Type": contentType,
     "Content-Length": payload.length,
-    "Content-Disposition": `attachment; filename="${encodeURIComponent(filename)}"`,
+    "Content-Disposition": buildContentDisposition(filename),
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": CORS_EXPOSE_HEADERS
+  });
+  response.end(payload);
+}
+
+function writeBuffer(response, statusCode, payload, contentType) {
+  response.writeHead(statusCode, {
+    "Content-Type": contentType,
+    "Content-Length": payload.length,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": CORS_EXPOSE_HEADERS
   });
   response.end(payload);
 }
@@ -160,6 +359,20 @@ async function readJsonBody(request) {
   }
 }
 
+async function readRawBody(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(chunk);
+  }
+
+  return chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+}
+
+function isJsonRequest(request) {
+  const contentType = String(request.headers["content-type"] || "").toLowerCase();
+  return !contentType || contentType.includes("application/json");
+}
+
 function normalizeError(error) {
   return {
     statusCode: error?.statusCode || 500,
@@ -190,25 +403,105 @@ function bufferFromArtifact(artifact) {
   return Buffer.from(String(artifact.content ?? ""), "utf8");
 }
 
+function hasBuiltFrontend() {
+  return existsSync(webIndexFilePath);
+}
+
+function getFrontendContentType(filePath) {
+  return FRONTEND_MIME_TYPES.get(path.extname(filePath).toLowerCase()) || "application/octet-stream";
+}
+
+function resolveFrontendPath(urlPathname) {
+  if (!hasBuiltFrontend()) {
+    return null;
+  }
+
+  let decodedPath = "/";
+  try {
+    decodedPath = decodeURIComponent(urlPathname || "/");
+  } catch {
+    return null;
+  }
+
+  const normalizedPath = decodedPath === "/" ? "/index.html" : decodedPath;
+  const candidatePath = path.resolve(webDistDir, `.${normalizedPath}`);
+  if (!candidatePath.startsWith(webDistDir + path.sep) && candidatePath !== webIndexFilePath) {
+    return null;
+  }
+
+  if (existsSync(candidatePath)) {
+    return candidatePath;
+  }
+
+  if (!path.extname(normalizedPath)) {
+    return webIndexFilePath;
+  }
+
+  return null;
+}
+
+function rewriteFrontendHtml(html, runtime) {
+  const prefix = runtime.basePath || "";
+  const runtimeScript = `<script>window.__TRANSLATE_BOOK_RUNTIME__=${JSON.stringify({
+    basePath: runtime.basePath,
+    apiBasePath: runtime.apiBasePath,
+    publicBaseUrl: runtime.publicBaseUrl
+  })};</script>`;
+
+  let nextHtml = String(html);
+  nextHtml = nextHtml
+    .replace(/(src|href)=["']\.\/assets\//g, `$1="${prefix}/assets/`)
+    .replace(/(src|href)=["']\/assets\//g, `$1="${prefix}/assets/`)
+    .replace(/(src|href)=["']\.\/vite\.svg["']/g, `$1="${prefix}/vite.svg"`)
+    .replace(/(src|href)=["']\/vite\.svg["']/g, `$1="${prefix}/vite.svg"`)
+    .replace(/(src|href)=["']\.\/favicon\.svg["']/g, `$1="${prefix}/favicon.svg"`)
+    .replace(/(src|href)=["']\/favicon\.svg["']/g, `$1="${prefix}/favicon.svg"`);
+
+  if (nextHtml.includes("</head>")) {
+    return nextHtml.replace("</head>", `${runtimeScript}</head>`);
+  }
+
+  return `${runtimeScript}${nextHtml}`;
+}
+
+async function serveFrontend(response, urlPathname, runtime) {
+  const frontendPath = resolveFrontendPath(urlPathname);
+  if (!frontendPath) {
+    return false;
+  }
+
+  if (path.extname(frontendPath).toLowerCase() === ".html") {
+    const content = await readFile(frontendPath, "utf8");
+    writeText(response, 200, rewriteFrontendHtml(content, runtime), getFrontendContentType(frontendPath));
+    return true;
+  }
+
+  const content = await readFile(frontendPath);
+  writeBuffer(response, 200, content, getFrontendContentType(frontendPath));
+  return true;
+}
+
 const server = createServer(async (request, response) => {
   if (request.method === "OPTIONS") {
     response.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+      "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+      "Access-Control-Expose-Headers": CORS_EXPOSE_HEADERS
     });
     response.end();
     return;
   }
 
-  const url = new URL(request.url, originOf(request));
+  const { rawUrl: url, pathname, runtime } = buildRequestContext(request);
   const requestId = nextRequestId++;
   const requestStartedAt = Date.now();
 
   log("INFO", "request:start", {
     id: requestId,
     method: request.method,
-    path: url.pathname
+    path: url.pathname,
+    resolvedPath: pathname
   });
 
   response.on("finish", () => {
@@ -216,15 +509,24 @@ const server = createServer(async (request, response) => {
       id: requestId,
       method: request.method,
       path: url.pathname,
+      resolvedPath: pathname,
       status: response.statusCode,
       durationMs: Date.now() - requestStartedAt
     });
   });
 
   try {
-    if (url.pathname === "/" && request.method === "GET") {
+    assertAuthorizedApiRequest(request, pathname);
+
+    if (pathname === "/" && request.method === "GET") {
+      if (await serveFrontend(response, pathname, runtime)) {
+        return;
+      }
       sendSuccess(response, 200, {
-        ...getServiceOverview(originOf(request)),
+        ...getServiceOverview({
+          publicBaseUrl: runtime.publicBaseUrl,
+          basePath: runtime.basePath
+        }),
         health: {
           status: "ok",
           uptimeSec: uptimeSeconds()
@@ -233,7 +535,7 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (url.pathname === "/health" && request.method === "GET") {
+    if (pathname === "/health" && request.method === "GET") {
       sendSuccess(response, 200, {
         status: "ok",
         service: SERVICE_INFO.name,
@@ -244,65 +546,106 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (url.pathname === "/api" && request.method === "GET") {
-      sendSuccess(response, 200, getServiceOverview(originOf(request)));
+    if (pathname === "/api" && request.method === "GET") {
+      sendSuccess(response, 200, getServiceOverview({
+        publicBaseUrl: runtime.publicBaseUrl,
+        basePath: runtime.basePath
+      }));
       return;
     }
 
-    if (url.pathname === "/api/docs" && request.method === "GET") {
-      sendSuccess(response, 200, buildApiDocs(originOf(request)));
+    if (pathname === "/api/docs" && request.method === "GET") {
+      sendSuccess(response, 200, buildApiDocs(runtime.publicBaseUrl));
       return;
     }
 
-    if ((url.pathname === "/openapi.yaml" || url.pathname === "/api/openapi.yaml") && request.method === "GET") {
+    if ((pathname === "/openapi.yaml" || pathname === "/api/openapi.yaml") && request.method === "GET") {
       const content = await readFile(openApiFilePath, "utf8");
       writeText(response, 200, content, "application/yaml; charset=utf-8");
       return;
     }
 
-    if (url.pathname === "/api/settings" && request.method === "GET") {
+    if (pathname === "/api/settings" && request.method === "GET") {
       sendSuccess(response, 200, getSettings());
       return;
     }
 
-    if (url.pathname === "/api/settings" && request.method === "PUT") {
+    if (pathname === "/api/settings" && request.method === "PUT") {
       const body = await readJsonBody(request);
       sendSuccess(response, 200, updateSettings(body));
       return;
     }
 
-    if (url.pathname === "/api/settings/test-connection" && request.method === "POST") {
+    if (pathname === "/api/settings/test-connection" && request.method === "POST") {
       sendSuccess(response, 200, await testProviderConnection());
       return;
     }
 
-    if ((url.pathname === "/api/settings/api-key/dotenv" || url.pathname === "/api/settings/api-key/env") && request.method === "POST") {
+    if ((pathname === "/api/settings/api-key/dotenv" || pathname === "/api/settings/api-key/env") && request.method === "POST") {
       assertLocalSecretMutation(request);
       const body = await readJsonBody(request);
       sendSuccess(response, 200, persistApiKeyToDotenv(body));
       return;
     }
 
-    if (url.pathname === "/api/settings/api-key" && request.method === "DELETE") {
+    if ((pathname === "/api/settings/access-token/dotenv" || pathname === "/api/settings/access-token/env") && request.method === "POST") {
       assertLocalSecretMutation(request);
+      const body = await readJsonBody(request);
+      sendSuccess(response, 200, persistAccessTokenToDotenv(body));
+      return;
+    }
+
+    if (pathname === "/api/settings/api-key" && request.method === "DELETE") {
       const scope = url.searchParams.get("scope") || "all";
+      if (scope !== "session") {
+        assertLocalSecretMutation(request);
+      }
       const envVarName = url.searchParams.get("envVarName") || undefined;
       sendSuccess(response, 200, clearApiKey({ scope, envVarName }));
       return;
     }
 
-    if (url.pathname === "/api/tasks" && request.method === "GET") {
+    if (pathname === "/api/settings/access-token" && request.method === "DELETE") {
+      const scope = url.searchParams.get("scope") || "all";
+      if (scope !== "session") {
+        assertLocalSecretMutation(request);
+      }
+      sendSuccess(response, 200, clearAccessToken({ scope }));
+      return;
+    }
+
+    if (pathname === "/api/tasks" && request.method === "GET") {
       sendSuccess(response, 200, listTasks());
       return;
     }
 
-    if (url.pathname === "/api/tasks" && request.method === "POST") {
-      const body = await readJsonBody(request);
-      sendSuccess(response, 201, await createTask(body));
+    if (pathname === "/api/tasks" && request.method === "POST") {
+      if (isJsonRequest(request)) {
+        const body = await readJsonBody(request);
+        sendSuccess(response, 201, await createTask(body));
+        return;
+      }
+
+      const rawBody = await readRawBody(request);
+      const filename = url.searchParams.get("filename") || "untitled.epub";
+      const documentFormat = url.searchParams.get("documentFormat") || "epub";
+      sendSuccess(response, 201, await createTask(
+        documentFormat === "epub"
+          ? {
+              filename,
+              documentFormat,
+              contentBuffer: rawBody
+            }
+          : {
+              filename,
+              documentFormat,
+              content: rawBody.toString("utf8")
+            }
+      ));
       return;
     }
 
-    const taskDetailMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+    const taskDetailMatch = pathname.match(/^\/api\/tasks\/([^/]+)$/);
     if (taskDetailMatch && request.method === "GET") {
       sendSuccess(response, 200, getTask(taskDetailMatch[1]));
       return;
@@ -313,76 +656,78 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const taskParseMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/parse$/);
+    const taskParseMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/parse$/);
     if (taskParseMatch && request.method === "POST") {
       const body = await readJsonBody(request);
       sendSuccess(response, 200, await reparseTask(taskParseMatch[1], body));
       return;
     }
 
-    const taskStatusMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/status$/);
+    const taskStatusMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/status$/);
     if (taskStatusMatch && request.method === "GET") {
       const pageSizeParam = url.searchParams.get("pageSize") || undefined;
       const normalizedPageSize = pageSizeParam === "all" ? "all" : (pageSizeParam === undefined ? undefined : Number(pageSizeParam));
       const pageParam = url.searchParams.get("page") || undefined;
       const normalizedPage = pageParam === undefined ? undefined : Number(pageParam);
+      const includeBlocksParam = url.searchParams.get("includeBlocks");
       sendSuccess(response, 200, getTaskStatus(taskStatusMatch[1], {
         page: normalizedPage,
-        pageSize: normalizedPageSize
+        pageSize: normalizedPageSize,
+        includeBlocks: includeBlocksParam === "1" || includeBlocksParam === "true"
       }));
       return;
     }
 
-    const taskPauseMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/pause$/);
+    const taskPauseMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/pause$/);
     if (taskPauseMatch && request.method === "POST") {
       sendSuccess(response, 200, pauseTask(taskPauseMatch[1]));
       return;
     }
 
-    const taskResumeMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
+    const taskResumeMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
     if (taskResumeMatch && request.method === "POST") {
       sendSuccess(response, 200, resumeTask(taskResumeMatch[1]));
       return;
     }
 
-    const taskCancelMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/cancel$/);
+    const taskCancelMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/cancel$/);
     if (taskCancelMatch && request.method === "POST") {
       sendSuccess(response, 200, cancelTask(taskCancelMatch[1]));
       return;
     }
 
-    const taskTranslateMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/translate$/);
+    const taskTranslateMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/translate$/);
     if (taskTranslateMatch && request.method === "POST") {
       sendSuccess(response, 200, startTaskTranslation(taskTranslateMatch[1]));
       return;
     }
 
-    const blockDetailMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)$/);
+    const blockDetailMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)$/);
     if (blockDetailMatch && request.method === "GET") {
       sendSuccess(response, 200, getBlock(blockDetailMatch[1], blockDetailMatch[2]));
       return;
     }
 
-    const blockPromptMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/prompt$/);
+    const blockPromptMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/prompt$/);
     if (blockPromptMatch && request.method === "GET") {
       sendSuccess(response, 200, getBlockPrompt(blockPromptMatch[1], blockPromptMatch[2]));
       return;
     }
 
-    const blockTranslateMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/translate$/);
+    const blockTranslateMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/translate$/);
     if (blockTranslateMatch && request.method === "POST") {
       sendSuccess(response, 200, startBlockTranslation(blockTranslateMatch[1], blockTranslateMatch[2]));
       return;
     }
 
-    const blockRetranslateMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/retranslate$/);
+    const blockRetranslateMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/([^/]+)\/retranslate$/);
     if (blockRetranslateMatch && request.method === "POST") {
       const body = await readJsonBody(request);
       sendSuccess(response, 200, retranslateBlock(blockRetranslateMatch[1], blockRetranslateMatch[2], body));
       return;
     }
 
-    const blockBatchRetranslateMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/retranslate-batch$/);
+    const blockBatchRetranslateMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/blocks\/retranslate-batch$/);
     if (blockBatchRetranslateMatch && request.method === "POST") {
       const body = await readJsonBody(request);
       sendSuccess(response, 200, retranslateBlocksBatch(blockBatchRetranslateMatch[1], body));
@@ -395,14 +740,34 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const annotationMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/annotations$/);
+    const annotationMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/annotations$/);
     if (annotationMatch && request.method === "POST") {
       const body = await readJsonBody(request);
       sendSuccess(response, 200, addAnnotation(annotationMatch[1], body.blockId, body.annotation));
       return;
     }
 
-    const exportMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/exports\/([^/]+)$/);
+    const exportJobsMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/exports\/jobs$/);
+    if (exportJobsMatch && request.method === "POST") {
+      const body = await readJsonBody(request);
+      sendSuccess(response, 202, createExportJob(exportJobsMatch[1], body));
+      return;
+    }
+
+    const exportJobDetailMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/exports\/jobs\/([^/]+)$/);
+    if (exportJobDetailMatch && request.method === "GET") {
+      sendSuccess(response, 200, getExportJob(exportJobDetailMatch[1], exportJobDetailMatch[2]));
+      return;
+    }
+
+    const exportJobDownloadMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/exports\/jobs\/([^/]+)\/download$/);
+    if (exportJobDownloadMatch && request.method === "GET") {
+      const result = await readExportJobArtifact(exportJobDownloadMatch[1], exportJobDownloadMatch[2]);
+      writeBinary(response, 200, result.payload, result.mimeType, result.filename);
+      return;
+    }
+
+    const exportMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/exports\/([^/]+)$/);
     if (exportMatch && request.method === "GET") {
       const result = await exportTask(exportMatch[1], exportMatch[2], {
         layout: url.searchParams.get("layout") || undefined
@@ -417,13 +782,19 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    sendError(response, 404, "not_found", `Route ${request.method} ${url.pathname} was not found.`);
+    if (request.method === "GET" && !pathname.startsWith("/api") && pathname !== "/health" && pathname !== "/openapi.yaml") {
+      if (await serveFrontend(response, pathname, runtime)) {
+        return;
+      }
+    }
+
+    sendError(response, 404, "not_found", `Route ${request.method} ${pathname} was not found.`);
   } catch (error) {
     const normalized = normalizeError(error);
     log("ERROR", "request:failed", {
       id: requestId,
       method: request.method,
-      path: url.pathname,
+      path: pathname,
       status: normalized.statusCode,
       code: normalized.code,
       error: normalized.message
@@ -511,6 +882,3 @@ process.on("uncaughtException", (error) => {
     error: error.message
   });
 });
-
-
-
