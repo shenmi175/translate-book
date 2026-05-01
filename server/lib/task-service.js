@@ -2498,7 +2498,10 @@ function mergeSettings(currentSettings, patch = {}) {
     if (typeof patch.apiKey !== "string") {
       throw createError(400, "invalid_request", "apiKey must be a string.");
     }
-    persistApiKeyToPermanentEnv(patch.apiKey);
+    const nextApiKey = patch.apiKey.trim();
+    if (nextApiKey) {
+      persistApiKeyToPermanentEnv(nextApiKey);
+    }
   }
 
   if (patch.accessToken !== undefined) {
@@ -2506,8 +2509,10 @@ function mergeSettings(currentSettings, patch = {}) {
       throw createError(400, "invalid_request", "accessToken must be a string.");
     }
     const nextAccessToken = patch.accessToken.trim();
-    runtimeSecrets.accessToken = "";
-    setPersistedSecret("accessToken", nextAccessToken);
+    if (nextAccessToken) {
+      runtimeSecrets.accessToken = "";
+      setPersistedSecret("accessToken", nextAccessToken);
+    }
   }
 
   const booleanFields = ["trustProxyHeaders"];
@@ -4672,6 +4677,11 @@ export async function exportTask(taskId, format, options = {}) {
 }
 
 export function clearAllState() {
+  if (DB_PATH === DEFAULT_SQLITE_PATH && process.env.MARKDOWN_TRANSLATOR_ALLOW_CLEAR_DEFAULT_STATE !== "1") {
+    throw new Error(
+      "Refusing to clear the default application database. Set MARKDOWN_TRANSLATOR_DB_PATH to a temporary test database, or set MARKDOWN_TRANSLATOR_ALLOW_CLEAR_DEFAULT_STATE=1 if you intentionally want to wipe local app data."
+    );
+  }
   if (saveTimeout) {
     clearTimeout(saveTimeout);
     saveTimeout = null;

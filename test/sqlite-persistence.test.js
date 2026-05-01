@@ -109,6 +109,61 @@ test('SQLite FTS search finds persisted block content after reload', async () =>
   }
 });
 
+test('creating a task does not clear the configured API key', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'translate-book-api-key-task-'));
+  const dbPath = path.join(tempDir, 'state.sqlite');
+  const dotenvPath = path.join(tempDir, 'runtime.env');
+  const previousDbPath = process.env.MARKDOWN_TRANSLATOR_DB_PATH;
+  const previousDotenvPath = process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH;
+  const previousApiKey = process.env.MARKDOWN_TRANSLATOR_API_KEY;
+
+  try {
+    process.env.MARKDOWN_TRANSLATOR_DB_PATH = dbPath;
+    process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH = dotenvPath;
+    delete process.env.MARKDOWN_TRANSLATOR_API_KEY;
+
+    const mod = await import(`${TASK_SERVICE_URL}?api-key-task=1`);
+    mod.clearAllState();
+    mod.updateSettings({
+      apiProvider: 'OpenAI-Compatible',
+      apiBaseUrl: 'https://example.test/v1',
+      apiProtocol: 'responses',
+      model: 'gpt-5.4',
+      apiKey: 'task-safe-key'
+    });
+
+    assert.equal(mod.getSettings().hasApiKey, true);
+
+    await mod.createTask({
+      filename: 'key-safe.md',
+      documentFormat: 'markdown',
+      content: 'Hello world'
+    });
+
+    const settingsAfterCreate = mod.getSettings();
+    assert.equal(settingsAfterCreate.hasApiKey, true);
+    assert.equal(settingsAfterCreate.apiKeySource, 'dotenv');
+    assert.match(fs.readFileSync(dotenvPath, 'utf8'), /^MARKDOWN_TRANSLATOR_API_KEY=task-safe-key/m);
+  } finally {
+    if (previousDbPath === undefined) {
+      delete process.env.MARKDOWN_TRANSLATOR_DB_PATH;
+    } else {
+      process.env.MARKDOWN_TRANSLATOR_DB_PATH = previousDbPath;
+    }
+    if (previousDotenvPath === undefined) {
+      delete process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH;
+    } else {
+      process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH = previousDotenvPath;
+    }
+    if (previousApiKey === undefined) {
+      delete process.env.MARKDOWN_TRANSLATOR_API_KEY;
+    } else {
+      process.env.MARKDOWN_TRANSLATOR_API_KEY = previousApiKey;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('SQLite stores export jobs separately from task payload rows', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'translate-book-sqlite-exports-'));
   const dbPath = path.join(tempDir, 'state.sqlite');

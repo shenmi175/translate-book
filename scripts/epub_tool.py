@@ -122,6 +122,15 @@ def get_structure_signature(node):
     return f"<{local_name(node.tag)}|{attribute_part}>{''.join(child_signatures)}</{local_name(node.tag)}>"
 
 
+def get_element_structure_signature(node):
+    if not isinstance(node.tag, str):
+        return ""
+    attribute_names = sorted(structure_attribute_name(name) for name in node.attrib.keys())
+    child_signatures = [get_element_structure_signature(child) for child in get_element_children(node)]
+    attribute_part = ",".join(attribute_names)
+    return f"<{local_name(node.tag)}|{attribute_part}>{''.join(child_signatures)}</{local_name(node.tag)}>"
+
+
 def get_visible_text(node, preserve_breaks=False):
     parts = []
 
@@ -273,14 +282,13 @@ def get_text_slot_setter(element, text_index):
     return None
 
 
-def set_target_value(root_element, descriptor, value):
+def resolve_target_location(root_element, descriptor):
     if descriptor["kind"] == "attribute":
         element_path = descriptor["path"].split("/@", 1)[0]
         target = find_element_by_path(root_element, element_path)
         if target is None:
             raise ValueError(f"Could not resolve segment target: {descriptor['path']}")
-        target.set(descriptor["attributeName"], value)
-        return
+        return ("attribute", target, descriptor["attributeName"])
 
     match = re.match(r"^(?P<element_path>.+)/#text\[(?P<index>\d+)\]$", descriptor["path"])
     if not match:
@@ -293,11 +301,23 @@ def set_target_value(root_element, descriptor, value):
     setter = get_text_slot_setter(target, text_index)
     if setter is None:
         raise ValueError(f"Could not resolve text slot: {descriptor['path']}")
-    kind, holder = setter
+    return setter
+
+
+def write_target_location(location, value):
+    kind, holder = location[:2]
+    if kind == "attribute":
+        attribute_name = location[2]
+        holder.set(attribute_name, value)
+        return
     if kind == "text":
         holder.text = value
     else:
         holder.tail = value
+
+
+def set_target_value(root_element, descriptor, value):
+    write_target_location(resolve_target_location(root_element, descriptor), value)
 
 
 def get_target_value(root_element, descriptor):
@@ -532,8 +552,9 @@ def apply_translated_segments(root_element, translated_segments):
     descriptors = get_translatable_segment_descriptors(root_element)
     if len(descriptors) != len(translated_segments):
         raise ValueError("Translated segment count does not match the source fragment.")
-    for descriptor, translated_value in zip(descriptors, translated_segments):
-        set_target_value(root_element, descriptor, str(translated_value))
+    target_locations = [resolve_target_location(root_element, descriptor) for descriptor in descriptors]
+    for target_location, translated_value in zip(target_locations, translated_segments):
+        write_target_location(target_location, str(translated_value))
 
 
 def new_counter_id(counters, prefix):
@@ -702,42 +723,25 @@ def create_epub_zip(source_directory, destination_path):
             archive.write(file_path, relative_path, compress_type=zipfile.ZIP_DEFLATED)
 
 
-def build_logical_children_for_merge(element):
-    children = []
-    if normalize_whitespace(element.text):
-        children.append(("text", element))
-    for child in get_element_children(element):
-        children.append(("element", child))
-        if normalize_whitespace(child.tail):
-            children.append(("tail", child))
-    return children
-
-
 def merge_translated_element(source_element, translated_element):
     if local_name(source_element.tag) != local_name(translated_element.tag):
         raise RuntimeError("Translated fragment root does not match the source fragment root.")
-    if get_structure_signature(source_element) != get_structure_signature(translated_element):
+    if get_element_structure_signature(source_element) != get_element_structure_signature(translated_element):
         raise RuntimeError("Translated fragment structure does not match the source fragment.")
 
     for attribute_name in ("alt", "title"):
         if attribute_name in translated_element.attrib:
             source_element.set(attribute_name, translated_element.attrib[attribute_name])
 
-    source_children = build_logical_children_for_merge(source_element)
-    translated_children = build_logical_children_for_merge(translated_element)
+    source_element.text = translated_element.text
+    source_children = get_element_children(source_element)
+    translated_children = get_element_children(translated_element)
     if len(source_children) != len(translated_children):
-        raise RuntimeError("Translated fragment logical child count does not match the source fragment.")
+        raise RuntimeError("Translated fragment child count does not match the source fragment.")
 
     for source_child, translated_child in zip(source_children, translated_children):
-        if source_child[0] != translated_child[0]:
-            raise RuntimeError("Translated fragment node types do not align with the source fragment.")
-        kind = source_child[0]
-        if kind == "text":
-            source_child[1].text = translated_child[1].text
-        elif kind == "tail":
-            source_child[1].tail = translated_child[1].tail
-        else:
-            merge_translated_element(source_child[1], translated_child[1])
+        merge_translated_element(source_child, translated_child)
+        source_child.tail = translated_child.tail
 
 
 def find_parent_and_child_index(root_element, target_element):
@@ -761,7 +765,7 @@ def mark_bilingual_translation_element(element):
 def insert_translated_element_after(root_element, source_element, translated_element):
     if local_name(source_element.tag) != local_name(translated_element.tag):
         raise RuntimeError("Translated fragment root does not match the source fragment root.")
-    if get_structure_signature(source_element) != get_structure_signature(translated_element):
+    if get_element_structure_signature(source_element) != get_element_structure_signature(translated_element):
         raise RuntimeError("Translated fragment structure does not match the source fragment.")
 
     parent, index = find_parent_and_child_index(root_element, source_element)

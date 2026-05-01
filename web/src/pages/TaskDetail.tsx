@@ -118,6 +118,13 @@ function toViewError(result: any, fallbackMessage: string): ViewError {
   };
 }
 
+function toViewErrorFromRequestError(error: any, fallbackMessage: string): ViewError {
+  return {
+    code: error?.response?.data?.error?.code || 'request_failed',
+    message: error?.response?.data?.error?.message || fallbackMessage
+  };
+}
+
 function formatProviderAwareErrorMessage(message: string | null | undefined, providerLabel: string) {
   if (!message) {
     return '';
@@ -301,7 +308,12 @@ export default function TaskDetail() {
       return true;
     } catch (error) {
       console.error(error);
-      setViewError({ code: 'request_failed', message: t('taskDetail.loadTaskFailedHint') });
+      const requestError = toViewErrorFromRequestError(error, t('taskDetail.loadTaskFailedHint'));
+      if (requestError.code === 'task_not_found') {
+        markTaskMissing(requestError.message || taskNotFoundMessage);
+        return false;
+      }
+      setViewError(requestError);
       return false;
     } finally {
       if (showLoading) setLoading(false);
