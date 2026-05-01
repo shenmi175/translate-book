@@ -4,8 +4,7 @@
 node_modules
 web/node_modules
 web/dist
-server/data/db.json
-server/data/tasks
+server/data
 tmp
 dist
 test

@@ -1,18 +1,71 @@
-﻿function buildChatCompletionsUrl(baseUrl) {
-  const trimmed = String(baseUrl || "").replace(/\/+$/, "");
+function stripKnownEndpointSuffix(baseUrl) {
+  return String(baseUrl || "").trim().replace(/\/+$/, "").replace(/\/(?:chat\/completions|responses)$/i, "");
+}
 
-  if (!trimmed) {
+export function normalizeApiProtocol(value, fallback = "chat_completions") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (["chat", "chat_completion", "chat_completions", "chatcompletions"].includes(normalized)) {
+    return "chat_completions";
+  }
+
+  if (["response", "responses"].includes(normalized)) {
+    return "responses";
+  }
+
+  return fallback;
+}
+
+function getEndpointSuffix(apiProtocol) {
+  return normalizeApiProtocol(apiProtocol) === "responses" ? "/responses" : "/chat/completions";
+}
+
+function buildProviderUrl(baseUrl, apiProtocol) {
+  const root = stripKnownEndpointSuffix(baseUrl);
+
+  if (!root) {
     throw new Error("apiBaseUrl is required.");
   }
 
-  if (trimmed.endsWith("/chat/completions")) {
-    return trimmed;
-  }
-
-  return `${trimmed}/chat/completions`;
+  return `${root}${getEndpointSuffix(apiProtocol)}`;
 }
 
-function extractAssistantContent(payload) {
+function extractTextPart(part) {
+  if (typeof part === "string") {
+    return part;
+  }
+
+  if (!part || typeof part !== "object") {
+    return "";
+  }
+
+  if (typeof part.text === "string") {
+    return part.text;
+  }
+
+  if (typeof part.content === "string") {
+    return part.content;
+  }
+
+  if (Array.isArray(part.content)) {
+    return part.content.map((item) => extractTextPart(item)).join("");
+  }
+
+  if (Array.isArray(part.text)) {
+    return part.text.map((item) => extractTextPart(item)).join("");
+  }
+
+  return "";
+}
+
+function extractChatCompletionsContent(payload) {
   const content = payload?.choices?.[0]?.message?.content;
 
   if (typeof content === "string") {
@@ -20,23 +73,61 @@ function extractAssistantContent(payload) {
   }
 
   if (Array.isArray(content)) {
-    return content
+    return content.map((item) => extractTextPart(item)).join("").trim();
+  }
+
+  return "";
+}
+
+function extractResponsesContent(payload) {
+  if (typeof payload?.output_text === "string") {
+    return payload.output_text.trim();
+  }
+
+  if (Array.isArray(payload?.output_text)) {
+    return payload.output_text.map((item) => extractTextPart(item)).join("").trim();
+  }
+
+  if (Array.isArray(payload?.output)) {
+    return payload.output
       .map((item) => {
-        if (typeof item === "string") {
-          return item;
+        if (Array.isArray(item?.content)) {
+          return item.content.map((part) => extractTextPart(part)).join("");
         }
-
-        if (item?.type === "text" && typeof item.text === "string") {
-          return item.text;
-        }
-
-        return "";
+        return extractTextPart(item);
       })
       .join("")
       .trim();
   }
 
   return "";
+}
+
+function extractAssistantContent(payload, apiProtocol) {
+  if (normalizeApiProtocol(apiProtocol) === "responses") {
+    return extractResponsesContent(payload) || extractChatCompletionsContent(payload);
+  }
+
+  return extractChatCompletionsContent(payload) || extractResponsesContent(payload);
+}
+
+function buildRequestBody({ provider, body }) {
+  const apiProtocol = normalizeApiProtocol(provider?.apiProtocol);
+  const model = provider?.model || "deepseek-chat";
+
+  if (apiProtocol === "responses") {
+    return {
+      model,
+      ...body
+    };
+  }
+
+  return {
+    model,
+    stream: false,
+    temperature: 0,
+    ...body
+  };
 }
 
 function getProviderLabel(provider) {
@@ -92,13 +183,14 @@ function logProvider(message, meta = {}) {
   console.log(`[${timestamp}] [INFO] provider:${message}${details ? ` ${details}` : ""}`);
 }
 
-async function requestChatCompletions({ provider, body, operation, signal: externalSignal }) {
+async function requestModelResponse({ provider, body, operation, signal: externalSignal }) {
   const providerLabel = getProviderLabel(provider);
   const apiKey = provider?.apiKey || "";
   const model = provider?.model || "deepseek-chat";
   const apiBaseUrl = provider?.apiBaseUrl || "https://api.deepseek.com";
+  const apiProtocol = normalizeApiProtocol(provider?.apiProtocol);
   const requestTimeoutMs = Number(provider?.requestTimeoutMs || 60000);
-  const url = buildChatCompletionsUrl(apiBaseUrl);
+  const url = buildProviderUrl(apiBaseUrl, apiProtocol);
 
   if (!apiKey) {
     throw new Error(`${providerLabel} API key is not configured.`);
@@ -125,6 +217,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
       provider: providerLabel,
       url,
       model,
+      apiProtocol,
       operation
     });
 
@@ -134,12 +227,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`
       },
-      body: JSON.stringify({
-        model,
-        stream: false,
-        temperature: 0,
-        ...body
-      }),
+      body: JSON.stringify(buildRequestBody({ provider: { ...provider, apiProtocol }, body })),
       signal: controller.signal
     });
 
@@ -162,11 +250,12 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
         requestUrl: url,
         providerLabel,
         model,
+        apiProtocol,
         elapsedMs
       });
     }
 
-    const translation = extractAssistantContent(payload);
+    const translation = extractAssistantContent(payload, apiProtocol);
     if (!translation) {
       throw Object.assign(new Error(`${providerLabel} API returned empty content.`), {
         responseStatus: response.status,
@@ -175,6 +264,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
         requestUrl: url,
         providerLabel,
         model,
+        apiProtocol,
         elapsedMs
       });
     }
@@ -183,6 +273,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
       provider: providerLabel,
       url,
       model,
+      apiProtocol,
       status: response.status,
       outputLength: translation.length,
       operation
@@ -195,6 +286,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
       url,
       providerLabel,
       model,
+      apiProtocol,
       elapsedMs
     };
   } catch (error) {
@@ -202,6 +294,7 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
       provider: providerLabel,
       url,
       model,
+      apiProtocol,
       operation,
       error: error instanceof Error ? error.message : String(error)
     });
@@ -226,23 +319,66 @@ async function requestChatCompletions({ provider, body, operation, signal: exter
   }
 }
 
-export async function translateWithDeepSeek({ provider, promptSnapshot, useRetranslationPrompt = false, signal }) {
-  const result = await requestChatCompletions({
+function buildTranslationRequestBody({ provider, promptSnapshot, useRetranslationPrompt }) {
+  const userPrompt = useRetranslationPrompt ? promptSnapshot.retranslationPrompt : promptSnapshot.translationPrompt;
+
+  if (normalizeApiProtocol(provider?.apiProtocol) === "responses") {
+    return {
+      instructions: promptSnapshot.systemPrompt,
+      input: userPrompt,
+      text: {
+        format: {
+          type: "text"
+        }
+      }
+    };
+  }
+
+  return {
+    messages: [
+      {
+        role: "system",
+        content: promptSnapshot.systemPrompt
+      },
+      {
+        role: "user",
+        content: userPrompt
+      }
+    ]
+  };
+}
+
+function buildConnectionTestBody(provider) {
+  if (normalizeApiProtocol(provider?.apiProtocol) === "responses") {
+    return {
+      instructions: "You are a connection probe. Reply with OK.",
+      input: "Reply with OK.",
+      max_output_tokens: 8,
+      text: {
+        format: {
+          type: "text"
+        }
+      }
+    };
+  }
+
+  return {
+    max_tokens: 8,
+    messages: [
+      {
+        role: "user",
+        content: "Reply with OK."
+      }
+    ]
+  };
+}
+
+export async function translateWithProvider({ provider, promptSnapshot, useRetranslationPrompt = false, signal }) {
+  const result = await requestModelResponse({
     provider,
     operation: useRetranslationPrompt ? "retranslation" : "translation",
     signal,
-    body: {
-      messages: [
-        {
-          role: "system",
-          content: promptSnapshot.systemPrompt
-        },
-        {
-          role: "user",
-          content: useRetranslationPrompt ? promptSnapshot.retranslationPrompt : promptSnapshot.translationPrompt
-        }
-      ]
-    }
+    body: buildTranslationRequestBody({ provider, promptSnapshot, useRetranslationPrompt })
   });
 
   return {
@@ -251,26 +387,19 @@ export async function translateWithDeepSeek({ provider, promptSnapshot, useRetra
   };
 }
 
-export async function testChatCompletionsConnection({ provider }) {
+export async function testProviderConnection({ provider }) {
   try {
-    const result = await requestChatCompletions({
+    const result = await requestModelResponse({
       provider,
       operation: "connection-test",
-      body: {
-        max_tokens: 8,
-        messages: [
-          {
-            role: "user",
-            content: "Reply with OK."
-          }
-        ]
-      }
+      body: buildConnectionTestBody(provider)
     });
 
     return {
       ok: true,
       provider: result.providerLabel,
       model: result.model,
+      apiProtocol: result.apiProtocol,
       url: result.url,
       status: result.status,
       latencyMs: result.elapsedMs,
@@ -278,11 +407,13 @@ export async function testChatCompletionsConnection({ provider }) {
       error: ""
     };
   } catch (error) {
+    const apiProtocol = normalizeApiProtocol(error?.apiProtocol || provider?.apiProtocol);
     return {
       ok: false,
       provider: error?.providerLabel || getProviderLabel(provider),
       model: error?.model || provider?.model || "",
-      url: error?.requestUrl || buildChatCompletionsUrl(provider?.apiBaseUrl || ""),
+      apiProtocol,
+      url: error?.requestUrl || (provider?.apiBaseUrl ? buildProviderUrl(provider.apiBaseUrl, apiProtocol) : ""),
       status: Number.isInteger(error?.responseStatus) ? error.responseStatus : 0,
       latencyMs: Number.isInteger(error?.elapsedMs) ? error.elapsedMs : 0,
       preview: "",
@@ -291,3 +422,6 @@ export async function testChatCompletionsConnection({ provider }) {
     };
   }
 }
+
+export const translateWithDeepSeek = translateWithProvider;
+export const testChatCompletionsConnection = testProviderConnection;

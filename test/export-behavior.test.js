@@ -19,6 +19,55 @@ import {
   updateBlock
 } from '../server/lib/task-service.js';
 
+async function installFakePandoc(t) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'mts-pandoc-test-'));
+  const fakePandocPath = path.join(tempDir, 'fake-pandoc.mjs');
+  const previousPandocBin = process.env.MARKDOWN_TRANSLATOR_PANDOC_BIN;
+
+  await writeFile(fakePandocPath, `#!/usr/bin/env node
+import fs from 'node:fs';
+
+const args = process.argv.slice(2);
+let outputPath = '';
+let inputPath = '';
+
+for (let index = 0; index < args.length; index += 1) {
+  const arg = args[index];
+  if (arg === '-o' || arg === '--output') {
+    outputPath = args[index + 1] || '';
+    index += 1;
+    continue;
+  }
+  if (arg.startsWith('-')) {
+    if (['--from', '--to', '--metadata-file', '--css'].includes(arg)) {
+      index += 1;
+    }
+    continue;
+  }
+  inputPath = arg;
+}
+
+if (!outputPath) {
+  process.stderr.write('missing output path');
+  process.exit(2);
+}
+
+const input = inputPath ? fs.readFileSync(inputPath, 'utf8') : '';
+fs.writeFileSync(outputPath, 'fake-epub\\n' + input, 'utf8');
+`, { mode: 0o755 });
+
+  process.env.MARKDOWN_TRANSLATOR_PANDOC_BIN = fakePandocPath;
+
+  t.after(async () => {
+    if (previousPandocBin === undefined) {
+      delete process.env.MARKDOWN_TRANSLATOR_PANDOC_BIN;
+    } else {
+      process.env.MARKDOWN_TRANSLATOR_PANDOC_BIN = previousPandocBin;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  });
+}
+
 test('translation-only markdown export uses a visible placeholder for unfinished blocks', () => {
   const output = mergeMarkdown([
     {
@@ -215,6 +264,86 @@ printf "merged-pdf" > "$last"
   assert.equal(Buffer.from(artifact.content, 'base64').toString('utf8'), 'merged-pdf');
   assert.ok(progressUpdates.some((progress) => progress.stage === 'rendering' && /chunk 1\//i.test(progress.detail)));
   assert.ok(progressUpdates.some((progress) => progress.stage === 'merging'));
+});
+
+test('markdown tasks can export translation-only EPUB via pandoc', async (t) => {
+  clearAllState();
+  await installFakePandoc(t);
+
+  const task = await createTask({
+    filename: 'demo.md',
+    documentFormat: 'markdown',
+    content: 'Hello world',
+    config: {
+      targetLanguage: 'Chinese'
+    }
+  });
+
+  t.after(async () => {
+    await deleteTask(task.id);
+    clearAllState();
+  });
+
+  const detail = getTask(task.id);
+  const blockId = detail.blocks.find((block) => block.shouldTranslate)?.id;
+  assert.ok(blockId, 'Expected a translatable markdown block.');
+
+  await updateBlock(task.id, blockId, { translatedMarkdown: '你好，世界' });
+  const artifact = await exportTask(task.id, 'epub');
+  const payload = Buffer.from(artifact.export.content, 'base64').toString('utf8');
+
+  assert.equal(artifact.export.filename, 'demo.zh-CN.epub');
+  assert.equal(artifact.export.mimeType, 'application/epub+zip');
+  assert.match(payload, /你好，世界/);
+});
+
+test('async export jobs cache markdown-to-EPUB bilingual downloads', async (t) => {
+  clearAllState();
+  await installFakePandoc(t);
+
+  const task = await createTask({
+    filename: 'async-epub.md',
+    documentFormat: 'markdown',
+    content: 'Hello world',
+    config: {
+      targetLanguage: 'Chinese'
+    }
+  });
+
+  t.after(async () => {
+    await deleteTask(task.id);
+    clearAllState();
+  });
+
+  const detail = getTask(task.id);
+  const blockId = detail.blocks.find((block) => block.shouldTranslate)?.id;
+  assert.ok(blockId, 'Expected a translatable markdown block.');
+  await updateBlock(task.id, blockId, { translatedMarkdown: '你好，世界' });
+
+  const queued = createExportJob(task.id, { format: 'epub_bilingual' });
+  assert.equal(queued.job.status, 'queued');
+
+  let completed = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const current = getExportJob(task.id, queued.job.id).job;
+    if (current.status === 'completed') {
+      completed = current;
+      break;
+    }
+    if (current.status === 'failed') {
+      assert.fail(current.errorMessage || 'Expected markdown-to-EPUB export job to complete.');
+    }
+    await delay(50);
+  }
+
+  assert.ok(completed, 'Expected export job to complete.');
+  assert.equal(completed.canDownload, true);
+
+  const artifact = await readExportJobArtifact(task.id, queued.job.id);
+  const payload = artifact.payload.toString('utf8');
+  assert.equal(artifact.filename, 'async-epub.bilingual.epub');
+  assert.match(payload, /Hello world/);
+  assert.match(payload, /你好，世界/);
 });
 
 test('async export jobs cache markdown downloads for later retrieval', async (t) => {

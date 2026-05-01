@@ -8,6 +8,7 @@ services:
       - "${PORT:-8787}:8787"
     environment:
       PORT: 8787
+      MARKDOWN_TRANSLATOR_DOTENV_PATH: /app/server/data/runtime/.env
       MARKDOWN_TRANSLATOR_API_KEY: ${MARKDOWN_TRANSLATOR_API_KEY:-}
       MARKDOWN_TRANSLATOR_ACCESS_TOKEN: ${MARKDOWN_TRANSLATOR_ACCESS_TOKEN:-}
     volumes:

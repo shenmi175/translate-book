@@ -20,34 +20,71 @@
 - EPUB 基于 XHTML / OPF / spine 解析
 - 块级翻译、单块重译、失败块批量重试
 - 导出 `Markdown`、双语 Markdown、`PDF`、双语 PDF、`EPUB`、双语 EPUB
-- API Key 和访问令牌都可保存在当前会话、`.env` 或容器环境变量
+- API Key 统一写入 `.env` 并立即生效，旧版 SQLite Key 会自动迁移清理
 - 支持反向代理、公开访问地址和子路径部署
 - 前端支持中文 / English 双语界面实时切换
 - 前端和后端可本地开发，也支持 Docker 一键部署
 - Docker 镜像内已包含 Chromium 和 Noto CJK 字体，中文 PDF 导出可直接使用
+- 任务状态默认持久化到 `server/data/app.sqlite`，重启后不会丢失
+- 块内容已拆分到独立 SQLite 表，任务搜索优先走 SQLite FTS
 
 ## 技术说明
 
 - 后端：Node.js 原生 HTTP 服务
+- 持久化：SQLite (`server/data/app.sqlite`) + 任务资产目录 (`server/data/tasks`)
 - 前端：React + Vite
 - EPUB 工具链：Python 3
-- 翻译接口：兼容 OpenAI Chat Completions 协议的提供商
+- 翻译接口：兼容 OpenAI Chat Completions 或 Responses 协议的提供商
 
-当前默认配置偏向 DeepSeek，但也可以接到其他兼容网关。
+当前默认配置偏向 DeepSeek，但也可以接到其他兼容网关；如果你的代理要求 `/v1/responses`，在设置里把接口协议切到 `Responses` 即可。
 
 ## 快速开始
 
+### 一键脚本
+
+项目现在提供统一入口脚本：
+
+```bash
+./scripts/install-run.sh
+```
+
+默认行为：
+
+- 如果当前机器可用 Docker，就直接走 Docker 模式
+- 如果 Docker 不可用，就切换到本机模式
+
+常用示例：
+
+```bash
+# Docker 一键构建并启动
+./scripts/install-run.sh --docker
+
+# Docker 启动后直接跟日志
+./scripts/install-run.sh --docker --logs
+
+# 本机一键安装依赖并启动
+./scripts/install-run.sh --native
+
+# 本机开发模式（API + Vite）
+./scripts/install-run.sh --native --dev
+```
+
+说明：
+
+- `--native` 模式会自动安装 npm 依赖
+- 在 Debian / Ubuntu 上，脚本会尝试通过 `apt-get` 安装 `python3`、`pandoc`、`fontconfig`、`fonts-noto-cjk`、`poppler-utils`，以及可用的 Chromium 包
+- `Node.js 22+` 仍然需要你自己预先安装，脚本不会擅自替你切换 Node 版本
+
 ### 30 秒上手
 
-如果你只是想最快把应用跑起来，按下面 5 步做：
+如果你只是想最快把应用跑起来，按下面 4 步做：
 
 1. 准备一个可用的上游模型 `API Key`
-2. 在项目根目录创建 `.env`
-3. 执行 `docker compose up -d --build`
-4. 执行 `cat server/data/runtime/access-token`，复制自动生成的访问令牌
-5. 打开 `http://localhost:8787`，先粘贴访问令牌，再去“设置”页填 `API Base URL`、`Model` 和 `API Key`
+2. 执行 `./scripts/install-run.sh --docker`
+3. 执行 `cat server/data/runtime/access-token`，复制自动生成的访问令牌
+4. 打开 `http://localhost:8787`，先粘贴访问令牌，再去“设置”页填 `API Base URL`、`Model` 和 `API Key`，点击“保存引擎配置”后会自动写入 `.env`
 
-最小 `.env` 示例：
+如果你想启动前就固定 API Key，也可以提前创建 `.env`：
 
 ```dotenv
 MARKDOWN_TRANSLATOR_API_KEY=your_api_key
@@ -112,10 +149,10 @@ cat server/data/runtime/access-token
 2. 启动
 
 ```bash
-docker compose up -d --build
+./scripts/install-run.sh --docker
 ```
 
-`docker-compose.yml` 会自动把宿主机 `.env` 中的 `MARKDOWN_TRANSLATOR_API_KEY` 和 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 传进容器；如果访问令牌为空，entrypoint 会在第一次启动时自动生成并落盘。
+`docker-compose.yml` 会自动把容器内可写 `.env` 指向 `./server/data/runtime/.env`，所以你在设置页保存的 API Key 会跟随 `server/data` 持久化；如果访问令牌为空，entrypoint 会在第一次启动时自动生成并落盘。
 
 3. 打开页面
 
@@ -129,7 +166,18 @@ docker compose up -d --build
 docker compose down
 ```
 
-默认会把 `./server/data` 挂载到容器内，用于持久化任务数据和导出所需的临时文件。
+默认会把 `./server/data` 挂载到容器内，用于持久化 SQLite 状态库、任务数据和导出所需的临时文件。
+
+当前持久化文件和目录：
+
+- `server/data/app.sqlite`
+  任务列表、块状态、设置、导出队列等元数据
+- `server/data/tasks`
+  EPUB 解析后的源文件和任务资产
+- `server/data/export-cache`
+  异步导出的缓存产物
+
+如果你是从旧版本升级过来，并且目录里还存在旧的 `server/data/db.json`，应用首次启动时会自动把它迁移到 `app.sqlite`，之后不再继续使用 `db.json`。
 
 首次启动后建议再执行一次：
 
@@ -154,10 +202,22 @@ npm install
 npm install --prefix web
 ```
 
+如果你想让脚本把依赖安装和启动一起处理，直接执行：
+
+```bash
+./scripts/install-run.sh --native
+```
+
+如果你已经手动装好了依赖，只想直接启动，可以执行：
+
+```bash
+./scripts/install-run.sh --native --no-install
+```
+
 启动开发环境：
 
 ```bash
-npm run dev
+./scripts/install-run.sh --native --dev
 ```
 
 默认地址：
@@ -175,9 +235,9 @@ npm run dev
 
 项目支持以下 API Key 来源，优先级从高到低：
 
-1. 当前后端会话内保存的 Key
-2. 进程环境变量
-3. 本地 `.env`
+1. 进程环境变量
+2. 本地 `.env`
+3. 旧版 SQLite Key 回退，启动后会自动迁移到 `.env` 并清理
 
 支持读取的环境变量名：
 
@@ -189,6 +249,7 @@ npm run dev
 
 ```dotenv
 MARKDOWN_TRANSLATOR_API_KEY=
+MARKDOWN_TRANSLATOR_DOTENV_PATH=
 MARKDOWN_TRANSLATOR_ACCESS_TOKEN=
 PORT=8787
 ```
@@ -220,8 +281,9 @@ PORT=8787
 
 说明：
 
-- 通过设置页“保存”写入的 API Key / 访问令牌，是当前后端会话级别，远程浏览器也可以操作
-- 通过设置页写入或删除 `.env` 的操作，仍然只允许本机回环访问
+- 通过设置页“保存引擎配置”写入的 API Key 会直接保存到 `.env` 并立即生效
+- Docker 模式默认把 `.env` 写到已挂载的 `./server/data/runtime/.env`，重建容器后仍然可用
+- 访问令牌仍可保存在 SQLite；只有你显式点击“写入 .env”时才会同步到本地文件，且该操作仍限制为服务器本机请求
 
 ## 使用流程
 

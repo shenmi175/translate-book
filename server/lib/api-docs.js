@@ -73,7 +73,7 @@ export function buildApiDocs(origin) {
       headerNames: ['Authorization: Bearer <token>', 'X-Access-Token: <token>']
     },
     settings: {
-      secretHandling: 'apiKey and accessToken are never persisted to db.json; send them per session or persist them into the local .env file as MARKDOWN_TRANSLATOR_API_KEY and MARKDOWN_TRANSLATOR_ACCESS_TOKEN.',
+      secretHandling: 'apiKey is written to the local .env file as MARKDOWN_TRANSLATOR_API_KEY when /api/settings is saved, and legacy SQLite apiKey metadata is migrated into .env on startup. accessToken may still be stored in SQLite or explicitly written to .env as MARKDOWN_TRANSLATOR_ACCESS_TOKEN.',
       responseFields: [
         'hasApiKey',
         'maskedApiKey',
@@ -92,8 +92,9 @@ export function buildApiDocs(origin) {
         'authRequired'
       ],
       secretMutationEndpoints: [
-        { method: 'POST', path: buildPath(basePath, '/api/settings/api-key/dotenv'), summary: 'Persist apiKey into the local .env file and activate it for the current process. Loopback requests only.' },
-        { method: 'DELETE', path: buildPath(basePath, '/api/settings/api-key?scope=session|dotenv|all'), summary: 'Clear the session key remotely, or remove it from the local .env file when called from loopback.' },
+        { method: 'PUT', path: buildPath(basePath, '/api/settings'), summary: 'Persist apiKey into the local .env file and activate it for the current process when apiKey is included.' },
+        { method: 'POST', path: buildPath(basePath, '/api/settings/api-key/dotenv'), summary: 'Compatibility endpoint that persists apiKey into the local .env file and activates it for the current process.' },
+        { method: 'DELETE', path: buildPath(basePath, '/api/settings/api-key?scope=session|database|dotenv|all'), summary: 'Clear legacy session/SQLite key state and/or remove the local .env API key.' },
         { method: 'POST', path: buildPath(basePath, '/api/settings/access-token/dotenv'), summary: 'Persist accessToken into the local .env file and activate API protection after restart. Loopback requests only.' },
         { method: 'DELETE', path: buildPath(basePath, '/api/settings/access-token?scope=session|dotenv|all'), summary: 'Clear the session access token remotely, or remove it from the local .env file when called from loopback.' }
       ]
@@ -107,8 +108,8 @@ export function buildApiDocs(origin) {
       { method: 'GET', path: openApiPath, summary: 'OpenAPI 3.1 YAML document' },
       { method: 'GET', path: buildPath(basePath, '/api/settings'), summary: 'Get backend settings' },
       { method: 'PUT', path: buildPath(basePath, '/api/settings'), summary: 'Update backend settings' },
-      { method: 'POST', path: buildPath(basePath, '/api/settings/api-key/dotenv'), summary: 'Persist the apiKey into the local .env file (loopback only)' },
-      { method: 'DELETE', path: buildPath(basePath, '/api/settings/api-key'), summary: 'Clear the session key, or remove it from the local .env file when called from loopback' },
+      { method: 'POST', path: buildPath(basePath, '/api/settings/api-key/dotenv'), summary: 'Compatibility endpoint for writing the apiKey into the local .env file' },
+      { method: 'DELETE', path: buildPath(basePath, '/api/settings/api-key'), summary: 'Clear legacy session/SQLite key state and/or remove the local .env API key' },
       { method: 'POST', path: buildPath(basePath, '/api/settings/access-token/dotenv'), summary: 'Persist the access token into the local .env file (loopback only)' },
       { method: 'DELETE', path: buildPath(basePath, '/api/settings/access-token'), summary: 'Clear the session access token, or remove it from the local .env file when called from loopback' },
       { method: 'GET', path: buildPath(basePath, '/api/tasks'), summary: 'List Markdown and EPUB tasks' },
@@ -131,7 +132,7 @@ export function buildApiDocs(origin) {
       {
         method: 'GET',
         path: buildPath(basePath, '/api/tasks/:taskId/exports/:format'),
-        summary: 'Export task artifacts. `pdf` supports layout=translation-only|bilingual, `epub` and `epub_bilingual` are available for EPUB tasks, and `download=true` returns raw bytes.',
+        summary: 'Export task artifacts. `pdf` supports layout=translation-only|bilingual, `epub` works for both Markdown and EPUB tasks, source EPUB tasks preserve original structure when possible, and `download=true` returns raw bytes.',
         pathParams: { format: EXPORT_FORMATS }
       }
     ]

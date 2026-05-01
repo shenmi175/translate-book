@@ -104,6 +104,7 @@ export const DEFAULT_SETTINGS = {
   apiProvider: "DeepSeek",
   apiKey: "",
   apiBaseUrl: "https://api.deepseek.com",
+  apiProtocol: "chat_completions",
   publicBaseUrl: "",
   trustProxyHeaders: false,
   model: "deepseek-chat",

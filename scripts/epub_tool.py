@@ -300,6 +300,144 @@ def set_target_value(root_element, descriptor, value):
         holder.tail = value
 
 
+def get_target_value(root_element, descriptor):
+    if descriptor["kind"] == "attribute":
+        element_path = descriptor["path"].split("/@", 1)[0]
+        target = find_element_by_path(root_element, element_path)
+        if target is None:
+            raise ValueError(f"Could not resolve segment target: {descriptor['path']}")
+        return normalize_whitespace(target.attrib.get(descriptor["attributeName"], ""))
+
+    match = re.match(r"^(?P<element_path>.+)/#text\[(?P<index>\d+)\]$", descriptor["path"])
+    if not match:
+        raise ValueError(f"Invalid text target path: {descriptor['path']}")
+    element_path = match.group("element_path")
+    text_index = int(match.group("index"))
+    target = find_element_by_path(root_element, element_path)
+    if target is None:
+        raise ValueError(f"Could not resolve text target: {descriptor['path']}")
+    setter = get_text_slot_setter(target, text_index)
+    if setter is None:
+        raise ValueError(f"Could not resolve text slot: {descriptor['path']}")
+    kind, holder = setter
+    raw_value = holder.text if kind == "text" else holder.tail
+    return normalize_whitespace(raw_value)
+
+
+def split_fallback_lines(value=""):
+    return [line.strip() for line in str(value or "").replace("\r\n", "\n").split("\n") if line.strip()]
+
+
+def split_text_proportionally(text, part_count, weights=None):
+    if part_count <= 0:
+        return []
+
+    normalized = normalize_preview_whitespace(text)
+    if part_count == 1:
+        return [normalized]
+    if not normalized:
+        return [""] * part_count
+
+    next_weights = list(weights or [])
+    if len(next_weights) < part_count:
+        next_weights.extend([1] * (part_count - len(next_weights)))
+    next_weights = [max(1, int(weight or 1)) for weight in next_weights[:part_count]]
+
+    def allocate(items, joiner):
+        chunks = []
+        start = 0
+        remaining_items = len(items)
+        remaining_weight = sum(next_weights) or part_count
+        for index in range(part_count):
+            if index == part_count - 1:
+                chunks.append(joiner.join(items[start:]).strip())
+                break
+            slots_left = part_count - index
+            weight = next_weights[index]
+            target_count = round(remaining_items * weight / remaining_weight) if remaining_weight > 0 else 1
+            target_count = max(1, int(target_count))
+            target_count = min(target_count, remaining_items - (slots_left - 1))
+            chunks.append(joiner.join(items[start : start + target_count]).strip())
+            start += target_count
+            remaining_items -= target_count
+            remaining_weight -= weight
+        while len(chunks) < part_count:
+            chunks.append("")
+        return chunks
+
+    if " " in normalized:
+        tokens = normalized.split()
+        return allocate(tokens, " ")
+
+    characters = list(normalized)
+    return allocate(characters, "")
+
+
+def build_safe_translated_segment_values(source_descriptors, fallback_text, block_type="", segment_template=""):
+    if not source_descriptors:
+        return []
+
+    values = [str(descriptor.get("sourceText", "")) if descriptor.get("kind") == "attribute" else "" for descriptor in source_descriptors]
+    text_indexes = [index for index, descriptor in enumerate(source_descriptors) if descriptor.get("kind") != "attribute"]
+    normalized_fallback = normalize_preview_whitespace(fallback_text)
+
+    if not text_indexes:
+        if len(source_descriptors) == 1:
+            values[0] = normalized_fallback
+        return values
+
+    if len(text_indexes) == 1:
+        values[text_indexes[0]] = normalized_fallback
+        return values
+
+    line_aware = str(block_type or "").strip().lower() == "blockquote" or "<br" in str(segment_template or "").lower()
+    lines = split_fallback_lines(normalized_fallback) if line_aware else []
+    if line_aware and len(lines) > 1:
+        for position, descriptor_index in enumerate(text_indexes):
+            if position < len(lines) - 1:
+                values[descriptor_index] = lines[position]
+            elif position == len(text_indexes) - 1:
+                values[descriptor_index] = " ".join(lines[position:]).strip()
+            else:
+                values[descriptor_index] = lines[position] if position < len(lines) else ""
+        return values
+
+    weights = [max(len(normalize_whitespace(source_descriptors[index].get("sourceText", ""))), 1) for index in text_indexes]
+    chunks = split_text_proportionally(normalized_fallback, len(text_indexes), weights)
+    for descriptor_index, chunk in zip(text_indexes, chunks):
+        values[descriptor_index] = chunk
+    return values
+
+
+def repair_translated_root_for_export(block, source_element, translated_root):
+    source_root = clone_element(source_element)
+    translation_unit = block.get("translationUnit") or {}
+    source_descriptors = list(translation_unit.get("segments") or get_translatable_segment_descriptors(source_root))
+    translated_descriptors = get_translatable_segment_descriptors(translated_root)
+
+    if source_descriptors and len(source_descriptors) == len(translated_descriptors):
+        translated_values = [get_target_value(translated_root, descriptor) for descriptor in translated_descriptors]
+        apply_translated_segments(source_root, translated_values)
+        return source_root
+
+    fallback_text = normalize_preview_whitespace(str(block.get("translatedMarkdown") or ""))
+    if not fallback_text:
+        fallback_text = get_visible_text(translated_root, preserve_breaks=True) or get_visible_text(source_root, preserve_breaks=True)
+
+    if source_descriptors:
+        translated_values = build_safe_translated_segment_values(
+            source_descriptors,
+            fallback_text,
+            block.get("type", ""),
+            translation_unit.get("segmentTemplate", ""),
+        )
+        apply_translated_segments(source_root, translated_values)
+        return source_root
+
+    source_root.text = fallback_text
+    return source_root
+
+
 def get_table_preview(element):
     lines = []
     for row in element.iter():
@@ -908,6 +1046,11 @@ def invoke_export_mode(args):
                     f"EPUB export could not find block node {translation_unit.get('nodePath')} in {translation_unit.get('chapterPath')}."
                 )
             translated_root = parse_xml_string(translated_fragment)
+            if (
+                local_name(target_node.tag) != local_name(translated_root.tag)
+                or get_structure_signature(target_node) != get_structure_signature(translated_root)
+            ):
+                translated_root = repair_translated_root_for_export(block, target_node, translated_root)
             if layout == "bilingual":
                 insert_translated_element_after(chapter_root, target_node, translated_root)
             else:

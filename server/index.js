@@ -31,6 +31,7 @@ import {
   reparseTask,
   retranslateBlock,
   retranslateBlocksBatch,
+  searchTaskBlocks,
   SERVICE_INFO,
   startBlockTranslation,
   startTaskTranslation,
@@ -222,18 +223,49 @@ function buildRequestContext(request) {
   };
 }
 
-function isLoopbackRequest(request) {
-  const remoteAddress = request.socket.remoteAddress || "";
-  return remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1";
+function normalizeClientAddress(value = "") {
+  const trimmed = String(value || "").trim();
+  return trimmed.startsWith("::ffff:") ? trimmed.slice(7) : trimmed;
 }
 
-function assertLocalSecretMutation(request) {
-  if (!isLoopbackRequest(request)) {
-    const error = new Error("Mutating host environment variables is only allowed from loopback requests.");
-    error.statusCode = 403;
-    error.code = "local_only_operation";
-    throw error;
+function isLoopbackAddress(value = "") {
+  const address = normalizeClientAddress(value);
+  return address === "127.0.0.1" || address === "::1";
+}
+
+function clientAddressOf(request) {
+  const settings = getSettings();
+  if (settings.trustProxyHeaders) {
+    const forwardedFor = firstHeaderValue(request.headers["x-forwarded-for"]);
+    if (forwardedFor) {
+      return normalizeClientAddress(forwardedFor);
+    }
   }
+
+  return normalizeClientAddress(request.socket.remoteAddress || "");
+}
+
+function isLoopbackRequest(request) {
+  return isLoopbackAddress(clientAddressOf(request));
+}
+
+function assertLocalSecretMutation(request, options = {}) {
+  if (isLoopbackRequest(request)) {
+    return;
+  }
+
+  if (options.allowAuthenticatedApi && isAuthenticatedApiRequest(request, options.pathname || "/api")) {
+    return;
+  }
+
+  const error = new Error(
+    options.allowAuthenticatedApi
+      ? "Persisting the API key is only allowed from loopback requests or authenticated API sessions protected by an access token. Open the app from the server's local localhost address, enable API access protection, or edit the .env file manually."
+      : "Mutating host environment variables is only allowed from loopback requests. Open the app from the server's local localhost address or edit the .env file manually."
+  );
+  error.statusCode = 403;
+  error.code = "local_only_operation";
+  throw error;
 }
 
 function presentedAccessTokenOf(request) {
@@ -254,14 +286,22 @@ function requiresApiAuthorization(pathname) {
   return !["/api", "/api/docs", "/api/openapi.yaml"].includes(pathname);
 }
 
-function assertAuthorizedApiRequest(request, pathname) {
+function isAuthenticatedApiRequest(request, pathname) {
   const expectedToken = getResolvedAccessTokenState().value;
   if (!expectedToken || !requiresApiAuthorization(pathname)) {
+    return false;
+  }
+
+  return presentedAccessTokenOf(request) === expectedToken;
+}
+
+function assertAuthorizedApiRequest(request, pathname) {
+  if (isAuthenticatedApiRequest(request, pathname)) {
     return;
   }
 
-  const presentedToken = presentedAccessTokenOf(request);
-  if (presentedToken === expectedToken) {
+  const expectedToken = getResolvedAccessTokenState().value;
+  if (!expectedToken || !requiresApiAuthorization(pathname)) {
     return;
   }
 
@@ -582,7 +622,7 @@ const server = createServer(async (request, response) => {
     }
 
     if ((pathname === "/api/settings/api-key/dotenv" || pathname === "/api/settings/api-key/env") && request.method === "POST") {
-      assertLocalSecretMutation(request);
+      assertLocalSecretMutation(request, { allowAuthenticatedApi: true, pathname });
       const body = await readJsonBody(request);
       sendSuccess(response, 200, persistApiKeyToDotenv(body));
       return;
@@ -598,7 +638,7 @@ const server = createServer(async (request, response) => {
     if (pathname === "/api/settings/api-key" && request.method === "DELETE") {
       const scope = url.searchParams.get("scope") || "all";
       if (scope !== "session") {
-        assertLocalSecretMutation(request);
+        assertLocalSecretMutation(request, { allowAuthenticatedApi: true, pathname });
       }
       const envVarName = url.searchParams.get("envVarName") || undefined;
       sendSuccess(response, 200, clearApiKey({ scope, envVarName }));
@@ -674,6 +714,16 @@ const server = createServer(async (request, response) => {
         page: normalizedPage,
         pageSize: normalizedPageSize,
         includeBlocks: includeBlocksParam === "1" || includeBlocksParam === "true"
+      }));
+      return;
+    }
+
+    const taskSearchMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/search$/);
+    if (taskSearchMatch && request.method === "GET") {
+      sendSuccess(response, 200, searchTaskBlocks(taskSearchMatch[1], {
+        query: url.searchParams.get("q") || "",
+        pageSize: Number(url.searchParams.get("pageSize") || 20),
+        limit: Number(url.searchParams.get("limit") || 50)
       }));
       return;
     }

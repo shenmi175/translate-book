@@ -38,6 +38,30 @@ function findSampleEpub(rootDir) {
 
 const SAMPLE_EPUB_PATH = findSampleEpub(TASKS_FIXTURE_DIR);
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function breakFragmentStructure(fragment) {
+  const rootMatch = String(fragment || '').match(/^<([A-Za-z][\w:-]*)\b/);
+  if (!rootMatch) {
+    return '';
+  }
+
+  const rootTag = rootMatch[1];
+  const tags = [...String(fragment).matchAll(/<([A-Za-z][\w:-]*)\b/g)].map((match) => match[1]);
+  const nestedTag = tags.find((name, index) => index > 0 && name !== rootTag && !['br', 'img'].includes(name.toLowerCase()));
+  if (!nestedTag) {
+    return '';
+  }
+
+  const replacementTag = nestedTag.toLowerCase() === 'span' ? 'strong' : 'span';
+  const escapedTag = escapeRegExp(nestedTag);
+  return String(fragment)
+    .replace(new RegExp(`<${escapedTag}(?=\\b)`, 'g'), `<${replacementTag}`)
+    .replace(new RegExp(`</${escapedTag}>`, 'g'), `</${replacementTag}>`);
+}
+
 test('EPUB parse and export smoke test', async (t) => {
   if (!SAMPLE_EPUB_PATH) {
     t.skip('No sample EPUB fixture is available under server/data/tasks.');
@@ -111,6 +135,78 @@ test('EPUB parse and export smoke test', async (t) => {
 
   assert.equal(bilingualArtifact.mimeType, 'application/epub+zip');
   assert.equal(bilingualArtifact.filename, 'fixture.bilingual.epub');
+  assert.equal(bilingualArtifact.layout, 'bilingual');
+  assert.ok(bilingualOutputBuffer.length > 0);
+  assert.equal(bilingualOutputBuffer.subarray(0, 2).toString('utf8'), 'PK');
+});
+
+test('EPUB bilingual export repairs translated fragment structure drift', async (t) => {
+  if (!SAMPLE_EPUB_PATH) {
+    t.skip('No sample EPUB fixture is available under server/data/tasks.');
+    return;
+  }
+
+  const contentBuffer = await readFile(SAMPLE_EPUB_PATH);
+  const taskId = randomUUID();
+  const parsed = await parseEpubArchive({
+    taskId,
+    contentBuffer
+  });
+
+  t.after(async () => {
+    await removeTaskArtifacts({ asset: parsed.asset });
+  });
+
+  const structuredBlock = parsed.blocks.find((block) =>
+    block.shouldTranslate
+    && block.translationUnit?.segmentTemplate
+    && (block.translationUnit.sourceFragment.match(/<([A-Za-z][\w:-]*)\b/g) || []).length > 1
+  );
+  if (!structuredBlock) {
+    t.skip('No structured EPUB fragment is available in the sample fixture.');
+    return;
+  }
+
+  const translatedSegments = structuredBlock.translationUnit.segments.map((segment, segmentIndex) => `${segment.sourceText} [ZH-${segmentIndex + 1}]`);
+  const applied = applyEpubTranslationUnit({
+    blockType: structuredBlock.type,
+    sourceMarkdown: structuredBlock.sourceMarkdown,
+    translationUnit: structuredBlock.translationUnit,
+    translatedSegments
+  });
+  const brokenFragment = breakFragmentStructure(applied.normalizedFragment);
+  if (!brokenFragment) {
+    t.skip('Failed to synthesize a structure-drift fragment from the sample block.');
+    return;
+  }
+
+  const exportTask = {
+    id: taskId,
+    filename: 'fixture.epub',
+    config: {
+      targetLanguage: 'English'
+    },
+    asset: parsed.asset,
+    blocks: parsed.blocks.map((block) => {
+      if (block.id !== structuredBlock.id) {
+        return block;
+      }
+      return {
+        ...block,
+        status: 'translated',
+        translatedMarkdown: applied.previewText,
+        translationUnit: {
+          ...block.translationUnit,
+          translatedFragment: brokenFragment
+        }
+      };
+    })
+  };
+
+  const bilingualArtifact = await buildEpubExport(exportTask, { layout: 'bilingual' });
+  const bilingualOutputBuffer = Buffer.from(bilingualArtifact.content, 'base64');
+
+  assert.equal(bilingualArtifact.mimeType, 'application/epub+zip');
   assert.equal(bilingualArtifact.layout, 'bilingual');
   assert.ok(bilingualOutputBuffer.length > 0);
   assert.equal(bilingualOutputBuffer.subarray(0, 2).toString('utf8'), 'PK');

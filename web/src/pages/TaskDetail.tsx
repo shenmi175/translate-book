@@ -4,7 +4,6 @@ import { createPortal } from 'react-dom';
 import {
   AlertTriangle,
   CheckCircle,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -14,6 +13,7 @@ import {
   Pause,
   PlayCircle,
   RefreshCw,
+  Save,
   XCircle
 } from 'lucide-react';
 import { Client, type ExportJobStatus, type TaskPageBlock, type TaskStatusResponse } from '../api';
@@ -22,14 +22,93 @@ import { useI18n } from '../i18n';
 const PAGE_SIZE = 20;
 const COMPLETED_STATUSES = new Set(['translated', 'edited', 'retranslated']);
 const PASSIVE_TASK_STAGES = new Set(['paused', 'cancelled', 'needs_review', 'review_ready']);
+const INLINE_EDITABLE_BLOCK_STATUSES = new Set(['translated', 'edited', 'retranslated', 'failed', 'paused', 'cancelled']);
 const EPUB_INTERNAL_PLACEHOLDER_PATTERN = /\[\[MTS_(?:OPEN|CLOSE|KEEP)_\d{4}\]\]/;
+const EXPORT_PREFERENCES_STORAGE_KEY = 'translate-book.task-detail.export-preferences';
 
 type ViewError = { code: string; message: string };
 type DisplayMode = 'compare' | 'source' | 'target';
 type ViewMode = 'pagination' | 'scroll';
+type ExportLayout = 'translation-only' | 'bilingual';
+type ExportFamily = 'markdown' | 'pdf' | 'epub';
+type InlineSaveIndicator = 'idle' | 'saving' | 'saved' | 'error';
+
+const DEFAULT_EXPORT_PREFERENCES: { family: ExportFamily; layout: ExportLayout; autoDownload: boolean } = {
+  family: 'pdf',
+  layout: 'translation-only',
+  autoDownload: true
+};
 
 function isActiveExportJob(job: ExportJobStatus | null | undefined) {
   return job?.status === 'queued' || job?.status === 'running';
+}
+
+function isExportFamily(value: unknown): value is ExportFamily {
+  return value === 'markdown' || value === 'pdf' || value === 'epub';
+}
+
+function isExportLayout(value: unknown): value is ExportLayout {
+  return value === 'translation-only' || value === 'bilingual';
+}
+
+function readSavedExportPreferences() {
+  if (typeof window === 'undefined') {
+    return DEFAULT_EXPORT_PREFERENCES;
+  }
+  try {
+    const raw = window.localStorage.getItem(EXPORT_PREFERENCES_STORAGE_KEY);
+    if (!raw) {
+      return DEFAULT_EXPORT_PREFERENCES;
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      family: isExportFamily(parsed?.family) ? parsed.family : DEFAULT_EXPORT_PREFERENCES.family,
+      layout: isExportLayout(parsed?.layout) ? parsed.layout : DEFAULT_EXPORT_PREFERENCES.layout,
+      autoDownload: typeof parsed?.autoDownload === 'boolean' ? parsed.autoDownload : DEFAULT_EXPORT_PREFERENCES.autoDownload
+    };
+  } catch {
+    return DEFAULT_EXPORT_PREFERENCES;
+  }
+}
+
+function persistExportPreferences(preferences: { family: ExportFamily; layout: ExportLayout; autoDownload: boolean }) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.setItem(EXPORT_PREFERENCES_STORAGE_KEY, JSON.stringify(preferences));
+  } catch {
+    // Ignore storage failures and keep the export UI usable.
+  }
+}
+
+function formatBytes(sizeBytes: number | undefined) {
+  const value = Number(sizeBytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 B';
+  }
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = size >= 100 || unitIndex === 0 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(decimals)} ${units[unitIndex]}`;
+}
+
+function formatExportDateTime(value: string | null | undefined, dateLocale: string) {
+  if (!value) {
+    return '';
+  }
+  return new Date(value).toLocaleString(dateLocale, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
 }
 
 function toViewError(result: any, fallbackMessage: string): ViewError {
@@ -54,13 +133,27 @@ function hasEpubInternalPlaceholders(value: string | null | undefined) {
   return EPUB_INTERNAL_PLACEHOLDER_PATTERN.test(String(value || ''));
 }
 
+function resolveInlineEditorDraft(block: TaskPageBlock) {
+  if (!block.shouldTranslate) {
+    return block.sourceMarkdown || '';
+  }
+  const candidate = block.reviewCandidateTranslation || '';
+  if (candidate && !hasEpubInternalPlaceholders(candidate)) {
+    return candidate;
+  }
+  return block.translatedMarkdown || '';
+}
+
 export default function TaskDetail() {
-  const { t, tTaskStage, dateLocale } = useI18n();
+  const { t, tTaskStage, tBlockStatus, dateLocale } = useI18n();
   const { taskId } = useParams<{ taskId: string }>();
   const taskNotFoundMessage = t('taskDetail.taskMissingMessage');
-  const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const blockNodeRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const pollingStoppedRef = useRef(false);
+  const inlineEditorHydratedBlockIdRef = useRef<string | null>(null);
+  const inlineAutosaveTimerRef = useRef<number | null>(null);
+  const inlineSavePromiseRef = useRef<Promise<boolean> | null>(null);
+  const savedExportPreferences = useMemo(() => readSavedExportPreferences(), []);
 
   const [status, setStatus] = useState<TaskStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -70,15 +163,37 @@ export default function TaskDetail() {
   const [currentPage, setCurrentPage] = useState(1);
   const [scrollPagesLoaded, setScrollPagesLoaded] = useState(1);
   const [isFocusMode, setIsFocusMode] = useState(false);
-  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [selectedExportFamily, setSelectedExportFamily] = useState<ExportFamily>(savedExportPreferences.family);
+  const [selectedExportLayout, setSelectedExportLayout] = useState<ExportLayout>(savedExportPreferences.layout);
+  const [exportAutoDownload, setExportAutoDownload] = useState(savedExportPreferences.autoDownload);
   const [pendingDownloadJobId, setPendingDownloadJobId] = useState<string | null>(null);
   const [viewError, setViewError] = useState<ViewError | null>(null);
   const [pendingFocusBlockId, setPendingFocusBlockId] = useState<string | null>(null);
   const [viewportWidth, setViewportWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 1600));
   const [retryRailBlocks, setRetryRailBlocks] = useState<Array<{ id: string; order: number }>>([]);
+  const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  const [inlineDraft, setInlineDraft] = useState('');
+  const [inlineSavedDraft, setInlineSavedDraft] = useState('');
+  const [inlineSaveIndicator, setInlineSaveIndicator] = useState<InlineSaveIndicator>('idle');
+  const [inlineSaveMessage, setInlineSaveMessage] = useState('');
+  const [inlineLastSavedAt, setInlineLastSavedAt] = useState<string | null>(null);
 
   const totalPages = status?.totalPages || 1;
   const visibleBlocks = status?.pageBlocks || [];
+  const selectedBlock = visibleBlocks.find((block) => block.id === selectedBlockId) || null;
+  const selectedBlockReviewState = selectedBlock?.reviewState || 'none';
+  const selectedBlockCandidate = selectedBlock?.reviewCandidateTranslation || '';
+  const selectedBlockCanConfirmCandidate = selectedBlockReviewState === 'pending_confirmation' && Boolean(selectedBlockCandidate);
+  const selectedBlockCandidateContainsInternalPlaceholders = hasEpubInternalPlaceholders(selectedBlockCandidate);
+  const selectedBlockErrorMessage = formatProviderAwareErrorMessage(selectedBlock?.errorMessage, status?.providerLabel || '');
+  const inlineEditorDirty = Boolean(selectedBlock && selectedBlock.shouldTranslate && inlineDraft !== inlineSavedDraft);
+  const inlineEditorCanSave = Boolean(
+    selectedBlock &&
+    selectedBlock.shouldTranslate &&
+    INLINE_EDITABLE_BLOCK_STATUSES.has(selectedBlock.status)
+  );
+  const inlineEditorSideBySide = !isFocusMode && viewportWidth >= 1560 && Boolean(selectedBlock);
 
   function TaskErrorState({ title, message }: { title: string; message: string }) {
     return (
@@ -193,9 +308,138 @@ export default function TaskDetail() {
     }
   }
 
+  function clearInlineAutosaveTimer() {
+    if (inlineAutosaveTimerRef.current !== null) {
+      window.clearTimeout(inlineAutosaveTimerRef.current);
+      inlineAutosaveTimerRef.current = null;
+    }
+  }
+
+  async function saveInlineDraft(trigger: 'manual' | 'autosave' | 'navigation' = 'manual') {
+    if (!taskId || !selectedBlock || !inlineEditorCanSave) {
+      return true;
+    }
+    if (inlineSavePromiseRef.current) {
+      return inlineSavePromiseRef.current;
+    }
+    if (!inlineEditorDirty) {
+      if (trigger !== 'autosave') {
+        setInlineSaveIndicator('saved');
+        setInlineSaveMessage(t('taskDetail.inlineEditorSaved'));
+      }
+      return true;
+    }
+
+    setInlineSaveIndicator('saving');
+    setInlineSaveMessage(t('taskDetail.inlineEditorSaving'));
+
+    const targetBlockId = selectedBlock.id;
+    const nextValue = inlineDraft;
+    const promise = (async () => {
+      const result = await Client.updateBlock(taskId, targetBlockId, { translatedMarkdown: nextValue });
+      if (!result.success) {
+        throw new Error(result.error?.message || t('taskDetail.inlineEditorSaveFailed'));
+      }
+      setInlineSavedDraft(nextValue);
+      setInlineLastSavedAt(new Date().toISOString());
+      setInlineSaveIndicator('saved');
+      setInlineSaveMessage(t('taskDetail.inlineEditorSaved'));
+      setStatus((current) => {
+        if (!current) {
+          return current;
+        }
+        const applySavedBlock = (block: TaskPageBlock | any) =>
+          block.id === targetBlockId
+            ? {
+                ...block,
+                translatedMarkdown: nextValue,
+                status: 'edited',
+                errorMessage: '',
+                reviewCandidateTranslation: '',
+                reviewErrorMessage: '',
+                reviewState: 'confirmed',
+                lastEditedAt: new Date().toISOString()
+              }
+            : block;
+        return {
+          ...current,
+          updatedAt: new Date().toISOString(),
+          failedBlocks: current.failedBlocks.filter((item) => item.id !== targetBlockId),
+          attentionBlocks: current.attentionBlocks.filter((item) => item.id !== targetBlockId),
+          blocks: current.blocks?.map(applySavedBlock),
+          pageBlocks: current.pageBlocks.map(applySavedBlock)
+        };
+      });
+      return true;
+    })()
+      .catch((error: any) => {
+        console.error(error);
+        setInlineSaveIndicator('error');
+        setInlineSaveMessage(error?.message || t('taskDetail.inlineEditorSaveFailed'));
+        return false;
+      })
+      .finally(() => {
+        inlineSavePromiseRef.current = null;
+      });
+
+    inlineSavePromiseRef.current = promise;
+    return promise;
+  }
+
+  async function ensureInlineEditorReady() {
+    if (!inlineEditorDirty) {
+      return true;
+    }
+    clearInlineAutosaveTimer();
+    return saveInlineDraft('navigation');
+  }
+
+  async function selectBlockForEditor(blockId: string) {
+    if (!blockId || blockId === selectedBlockId) {
+      return;
+    }
+    if (!(await ensureInlineEditorReady())) {
+      return;
+    }
+    setSelectedBlockId(blockId);
+  }
+
+  async function changePage(nextPage: number) {
+    if (!(await ensureInlineEditorReady())) {
+      return;
+    }
+    setCurrentPage(nextPage);
+  }
+
+  async function changeViewMode(nextViewMode: ViewMode) {
+    if (nextViewMode === viewMode) {
+      return;
+    }
+    if (!(await ensureInlineEditorReady())) {
+      return;
+    }
+    setViewMode(nextViewMode);
+    if (nextViewMode === 'pagination') {
+      setCurrentPage(1);
+    } else {
+      setScrollPagesLoaded(1);
+    }
+  }
+
+  async function toggleReadingMode(nextValue: boolean) {
+    if (nextValue === isFocusMode) {
+      return;
+    }
+    if (!(await ensureInlineEditorReady())) {
+      return;
+    }
+    setIsFocusMode(nextValue);
+  }
+
   useEffect(() => {
     setCurrentPage(1);
     setScrollPagesLoaded(1);
+    setSelectedBlockId(null);
   }, [taskId]);
 
   const exportJobs = useMemo(() => status?.exportJobs || [], [status]);
@@ -229,34 +473,100 @@ export default function TaskDetail() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
-      if (viewMode === 'pagination' && (event.key === 'ArrowLeft' || event.key === 'ArrowUp')) {
-        setCurrentPage((page) => Math.max(1, page - 1));
-      } else if (viewMode === 'pagination' && (event.key === 'ArrowRight' || event.key === 'ArrowDown')) {
-        setCurrentPage((page) => Math.min(totalPages, page + 1));
-      } else if (event.key === 'Escape') {
+      if (event.key === 'Escape') {
+        setExportDialogOpen(false);
         setIsFocusMode(false);
-        setExportMenuOpen(false);
+        return;
+      }
+      if (exportDialogOpen) {
+        return;
+      }
+      if (viewMode === 'pagination' && (event.key === 'ArrowLeft' || event.key === 'ArrowUp')) {
+        void changePage(Math.max(1, currentPage - 1));
+      } else if (viewMode === 'pagination' && (event.key === 'ArrowRight' || event.key === 'ArrowDown')) {
+        void changePage(Math.min(totalPages, currentPage + 1));
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [totalPages, viewMode]);
-
-  useEffect(() => {
-    const handlePointerDown = (event: MouseEvent) => {
-      if (exportMenuRef.current && !exportMenuRef.current.contains(event.target as Node)) {
-        setExportMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, []);
+  }, [currentPage, exportDialogOpen, totalPages, viewMode, inlineEditorDirty]);
 
   useEffect(() => {
     const handleResize = () => setViewportWidth(window.innerWidth);
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  useEffect(() => {
+    if (!visibleBlocks.length) {
+      setSelectedBlockId(null);
+      return;
+    }
+    if (pendingFocusBlockId && visibleBlocks.some((block) => block.id === pendingFocusBlockId)) {
+      setSelectedBlockId(pendingFocusBlockId);
+      return;
+    }
+    if (selectedBlockId && visibleBlocks.some((block) => block.id === selectedBlockId)) {
+      return;
+    }
+    const nextSelected = visibleBlocks.find((block) => block.status === 'failed')?.id || visibleBlocks[0]?.id || null;
+    setSelectedBlockId(nextSelected);
+  }, [pendingFocusBlockId, selectedBlockId, visibleBlocks]);
+
+  useEffect(() => {
+    if (!selectedBlock) {
+      inlineEditorHydratedBlockIdRef.current = null;
+      setInlineDraft('');
+      setInlineSavedDraft('');
+      setInlineSaveIndicator('idle');
+      setInlineSaveMessage('');
+      return;
+    }
+    const nextDraft = resolveInlineEditorDraft(selectedBlock);
+    const isSwitchingBlock = inlineEditorHydratedBlockIdRef.current !== selectedBlock.id;
+    const shouldHydrate = isSwitchingBlock || !inlineEditorDirty;
+    if (shouldHydrate) {
+      setInlineDraft(nextDraft);
+      setInlineSavedDraft(nextDraft);
+      if (inlineSaveIndicator !== 'saving') {
+        setInlineSaveIndicator('idle');
+        setInlineSaveMessage('');
+      }
+    }
+    inlineEditorHydratedBlockIdRef.current = selectedBlock.id;
+  }, [
+    selectedBlock,
+    selectedBlock?.id,
+    selectedBlock?.translatedMarkdown,
+    selectedBlock?.reviewCandidateTranslation,
+    selectedBlock?.sourceMarkdown,
+    selectedBlock?.status,
+    inlineEditorDirty,
+    inlineSaveIndicator
+  ]);
+
+  useEffect(() => {
+    clearInlineAutosaveTimer();
+    if (!inlineEditorDirty || !inlineEditorCanSave || isFocusMode) {
+      return;
+    }
+    inlineAutosaveTimerRef.current = window.setTimeout(() => {
+      void saveInlineDraft('autosave');
+    }, 1000);
+    return () => clearInlineAutosaveTimer();
+  }, [inlineDraft, inlineEditorCanSave, inlineEditorDirty, isFocusMode, selectedBlock?.id]);
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!inlineEditorDirty && !inlineSavePromiseRef.current) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [inlineEditorDirty]);
 
   const failedBlocks = useMemo(() => status?.failedBlocks || [], [status]);
   const stats = useMemo(() => {
@@ -276,23 +586,31 @@ export default function TaskDetail() {
   const railBlocks = failedBlocks.length > 0 ? failedBlocks : retryRailBlocks;
   const retryRailActive = retryRailBlocks.length > 0 && failedBlocks.length === 0 && (activeBlockCount > 0 || status?.stage === 'translating');
   const railCount = failedBlocks.length > 0 ? stats.failed : retryRailBlocks.length;
-  const showErrorRail = !isFocusMode && railBlocks.length > 0 && viewportWidth >= 1280;
   const sidebarToolSlot = typeof document !== 'undefined' ? document.getElementById('sidebar-tool-slot') : null;
-  const canUseSidebarRail = showErrorRail && Boolean(sidebarToolSlot);
   const latestExportJob = exportJobs[0] || null;
-  const exportOptions = useMemo(() => {
-    const items = [
-      { format: 'markdown', label: t('taskDetail.export.markdown') },
-      { format: 'markdown_bilingual', label: t('taskDetail.export.markdown_bilingual') },
-      { format: 'pdf', label: t('taskDetail.export.pdf') },
-      { format: 'pdf_bilingual', label: t('taskDetail.export.pdf_bilingual') }
+  const latestExportCompletedAt = latestExportJob?.finishedAt || latestExportJob?.generatedAt || '';
+  const canUseSidebarTools = !isFocusMode && viewportWidth >= 1280 && Boolean(sidebarToolSlot);
+  const shouldRenderInlineTools = !isFocusMode && !canUseSidebarTools;
+  const exportFamilies = useMemo(() => {
+    const items: Array<{ family: ExportFamily; label: string; description: string }> = [
+      {
+        family: 'markdown',
+        label: t('taskDetail.exportFamily.markdown'),
+        description: t('taskDetail.exportFamily.markdownHint')
+      },
+      {
+        family: 'pdf',
+        label: t('taskDetail.exportFamily.pdf'),
+        description: t('taskDetail.exportFamily.pdfHint')
+      },
+      {
+        family: 'epub',
+        label: t('taskDetail.exportFamily.epub'),
+        description: t('taskDetail.exportFamily.epubHint')
+      }
     ];
-    if (status?.documentFormat === 'epub') {
-      items.push({ format: 'epub', label: t('taskDetail.export.epub') });
-      items.push({ format: 'epub_bilingual', label: t('taskDetail.export.epub_bilingual') });
-    }
     return items;
-  }, [status?.documentFormat, t]);
+  }, [t]);
 
   useEffect(() => {
     if (failedBlocks.length > 0) {
@@ -390,15 +708,37 @@ export default function TaskDetail() {
     }
   }
 
-  async function handleExport(format: string) {
+  function resolveExportRequest(family: ExportFamily, layout: ExportLayout) {
+    if (family === 'markdown') {
+      return { format: layout === 'bilingual' ? 'markdown_bilingual' : 'markdown' };
+    }
+    if (family === 'pdf') {
+      return {
+        format: layout === 'bilingual' ? 'pdf_bilingual' : 'pdf',
+        layout
+      };
+    }
+    return {
+      format: layout === 'bilingual' ? 'epub_bilingual' : 'epub',
+      layout
+    };
+  }
+
+  async function handleExportSubmit() {
     if (!taskId) return;
     try {
-      const result = await Client.createExportJob(taskId, { format });
+      const payload = resolveExportRequest(selectedExportFamily, selectedExportLayout);
+      const result = await Client.createExportJob(taskId, payload);
       if (!result.success || !result.data?.job) {
         throw new Error(result.error?.message || t('taskDetail.exportFailed'));
       }
-      setPendingDownloadJobId(result.data.job.id);
-      setExportMenuOpen(false);
+      persistExportPreferences({
+        family: selectedExportFamily,
+        layout: selectedExportLayout,
+        autoDownload: exportAutoDownload
+      });
+      setPendingDownloadJobId(exportAutoDownload ? result.data.job.id : null);
+      setExportDialogOpen(false);
       await fetchStatus(taskId);
     } catch (error: any) {
       console.error(error);
@@ -454,8 +794,15 @@ export default function TaskDetail() {
     return t(`taskDetail.exportStatus.${job.status}`);
   }
 
-  function jumpToError(direction: 'prev' | 'next') {
+  function getExportStageLabel(job: ExportJobStatus) {
+    return t(`taskDetail.exportStage.${job.progress.stage}`);
+  }
+
+  async function jumpToError(direction: 'prev' | 'next') {
     if (!railBlocks.length || !status) return;
+    if (!(await ensureInlineEditorReady())) {
+      return;
+    }
     const currentId = firstVisibleErrorId;
     let currentIndex = railBlocks.findIndex((block) => block.id === currentId);
     if (currentIndex < 0) currentIndex = direction === 'next' ? -1 : railBlocks.length;
@@ -463,6 +810,7 @@ export default function TaskDetail() {
     const targetBlock = railBlocks[nextIndex];
     if (!targetBlock) return;
     setPendingFocusBlockId(targetBlock.id);
+    setSelectedBlockId(targetBlock.id);
     if (viewMode === 'pagination') {
       setCurrentPage(Math.floor(targetBlock.order / PAGE_SIZE) + 1);
     } else {
@@ -579,6 +927,113 @@ export default function TaskDetail() {
   if (viewError && !status) return <TaskErrorState title={t('taskDetail.loadFailedTitle')} message={viewError.message} />;
   if (!status) return <div style={{ padding: '2rem', textAlign: 'center' }}>{t('taskDetail.emptyState')}</div>;
 
+  const exportQueueWidget = (
+    <div
+      className="glass-panel"
+      style={{
+        padding: '1rem',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.8rem'
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>{t('taskDetail.exportQueueTitle')}</div>
+          <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '0.2rem', lineHeight: 1.5 }}>
+            {pendingDownloadJobId ? t('taskDetail.exportAutoDownloadWaiting') : t('taskDetail.exportQueueHint')}
+          </div>
+        </div>
+        <button className="glass-button primary" onClick={() => setExportDialogOpen(true)} disabled={!canExport}>
+          <Download size={15} /> {t('taskDetail.exportOpenDialog')}
+        </button>
+      </div>
+      {latestExportJob ? (
+        <>
+          <div style={{ padding: '0.9rem', borderRadius: '12px', background: 'var(--shadow-light)', boxShadow: 'var(--neu-shadow-inset)', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontWeight: 700 }}>{getExportLabel(latestExportJob.format)}</div>
+                <div style={{ color: 'var(--text-secondary)', fontSize: '0.82rem', marginTop: '0.2rem', lineHeight: 1.5 }}>
+                  {getExportStatusLabel(latestExportJob)} · {new Date(latestExportJob.createdAt).toLocaleTimeString(dateLocale)}
+                </div>
+              </div>
+              <span
+                style={{
+                  padding: '0.2rem 0.6rem',
+                  borderRadius: '999px',
+                  fontSize: '0.78rem',
+                  fontWeight: 700,
+                  color: latestExportJob.status === 'failed'
+                    ? 'var(--danger-color)'
+                    : latestExportJob.canDownload
+                      ? 'var(--success-color)'
+                      : 'var(--primary-color)',
+                  background: latestExportJob.status === 'failed'
+                    ? 'rgba(239, 68, 68, 0.14)'
+                    : latestExportJob.canDownload
+                      ? 'rgba(16, 185, 129, 0.14)'
+                      : 'rgba(96, 165, 250, 0.14)'
+                }}
+              >
+                {getExportStageLabel(latestExportJob)}
+              </span>
+            </div>
+            <div style={{ height: '8px', borderRadius: '999px', background: 'rgba(148, 163, 184, 0.18)', overflow: 'hidden' }}>
+              <div
+                style={{
+                  width: `${latestExportJob.progress.percent}%`,
+                  height: '100%',
+                  background: latestExportJob.status === 'failed' ? 'var(--danger-color)' : 'var(--primary-color)',
+                  transition: 'width 0.3s ease'
+                }}
+              />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap', color: 'var(--text-secondary)', fontSize: '0.82rem', lineHeight: 1.5 }}>
+              <span>{latestExportJob.progress.percent}%</span>
+              {latestExportJob.progress.detail ? <span>{latestExportJob.progress.detail}</span> : null}
+              {latestExportJob.errorMessage ? <span className="text-danger">{latestExportJob.errorMessage}</span> : null}
+              {latestExportJob.stale ? <span>{t('taskDetail.exportStaleHint')}</span> : null}
+            </div>
+            {(latestExportCompletedAt || latestExportJob.sizeBytes > 0) && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.65rem' }}>
+                {latestExportCompletedAt ? (
+                  <div style={{ padding: '0.7rem 0.8rem', borderRadius: '10px', background: 'rgba(255,255,255,0.45)', boxShadow: 'var(--neu-shadow-inset)' }}>
+                    <div style={{ fontSize: '0.74rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+                      {t('taskDetail.exportFinishedAt')}
+                    </div>
+                    <div style={{ marginTop: '0.25rem', fontSize: '0.88rem', fontWeight: 600 }}>
+                      {formatExportDateTime(latestExportCompletedAt, dateLocale)}
+                    </div>
+                  </div>
+                ) : null}
+                {latestExportJob.sizeBytes > 0 ? (
+                  <div style={{ padding: '0.7rem 0.8rem', borderRadius: '10px', background: 'rgba(255,255,255,0.45)', boxShadow: 'var(--neu-shadow-inset)' }}>
+                    <div style={{ fontSize: '0.74rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+                      {t('taskDetail.exportFileSize')}
+                    </div>
+                    <div style={{ marginTop: '0.25rem', fontSize: '0.88rem', fontWeight: 600 }}>
+                      {formatBytes(latestExportJob.sizeBytes)}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </div>
+          {latestExportJob.canDownload && (
+            <button className="glass-button primary" onClick={() => void handleExportJobDownload(latestExportJob)} style={{ width: '100%', justifyContent: 'flex-start' }}>
+              <Download size={16} /> {t('taskDetail.exportDownload')}
+            </button>
+          )}
+        </>
+      ) : (
+        <div style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', lineHeight: 1.6 }}>
+          {t('taskDetail.exportQueueEmpty')}
+        </div>
+      )}
+    </div>
+  );
+
   const errorRail = (
     <div
       className="glass-panel"
@@ -590,27 +1045,174 @@ export default function TaskDetail() {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontWeight: 700 }}>
-        <AlertTriangle size={18} className="text-danger" />
-        <span>{retryRailActive ? t('common.processing') : t('taskDetail.failed', { count: railCount })}</span>
+        <AlertTriangle size={18} className={railCount > 0 ? 'text-danger' : 'text-primary'} />
+        <span>{t('taskDetail.errorRailTitle')}</span>
       </div>
-      <button className="glass-button" onClick={() => jumpToError('prev')} style={{ width: '100%', justifyContent: 'flex-start' }}>
+      <div
+        style={{
+          padding: '0.85rem 0.95rem',
+          borderRadius: '12px',
+          background: 'var(--shadow-light)',
+          boxShadow: 'var(--neu-shadow-inset)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.45rem'
+        }}
+      >
+        <div style={{ fontWeight: 700, color: railCount > 0 ? 'var(--danger-color)' : 'var(--primary-color)' }}>
+          {retryRailActive ? t('common.processing') : railCount > 0 ? t('taskDetail.failed', { count: railCount }) : t('taskDetail.errorRailClear')}
+        </div>
+        <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', lineHeight: 1.55 }}>
+          {railCount > 0 || retryRailActive ? t('taskDetail.errorRailHint') : t('taskDetail.errorRailPersistHint')}
+        </div>
+      </div>
+      <button className="glass-button" onClick={() => void jumpToError('prev')} disabled={railBlocks.length === 0} style={{ width: '100%', justifyContent: 'flex-start' }}>
         <ChevronLeft size={16} /> {t('taskDetail.prevError')}
       </button>
-      <button className="glass-button" onClick={() => jumpToError('next')} style={{ width: '100%', justifyContent: 'flex-start' }}>
+      <button className="glass-button" onClick={() => void jumpToError('next')} disabled={railBlocks.length === 0} style={{ width: '100%', justifyContent: 'flex-start' }}>
         <ChevronRight size={16} /> {t('taskDetail.nextError')}
       </button>
       <button className="glass-button" onClick={handleRetranslateFailed} disabled={actionBusy !== null || failedBlocks.length === 0} style={{ width: '100%', justifyContent: 'flex-start' }}>
         <RefreshCw size={16} /> {t('taskDetail.retryAll')}
       </button>
-      <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', lineHeight: 1.6 }}>
-        {t('taskDetail.errorRailHint')}
-      </div>
     </div>
   );
 
+  const utilityPanels = (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+      {exportQueueWidget}
+      {errorRail}
+    </div>
+  );
+
+  const inlineEditorPanel = !isFocusMode && selectedBlock ? (
+    <div
+      className="glass-panel"
+      style={{
+        padding: '1rem',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.85rem',
+        alignSelf: 'flex-start',
+        position: inlineEditorSideBySide ? 'sticky' : 'static',
+        top: inlineEditorSideBySide ? '1rem' : undefined
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>
+            {t('taskDetail.inlineEditorTitle')} #{selectedBlock.order + 1}
+          </div>
+          <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', marginTop: '0.2rem', lineHeight: 1.55 }}>
+            {selectedBlock.headingPath?.length ? selectedBlock.headingPath.join(' / ') : t('taskEditor.noHeading')}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+        <span style={{ color: selectedBlock.status === 'failed' ? 'var(--danger-color)' : 'var(--text-secondary)', fontSize: '0.85rem', fontWeight: 600 }}>
+          {tBlockStatus(selectedBlock.status)}
+        </span>
+        {inlineEditorDirty ? (
+          <span style={{ color: 'var(--warning-color)', fontSize: '0.82rem', fontWeight: 700 }}>
+            {t('taskDetail.inlineEditorDirty')}
+          </span>
+        ) : null}
+        {selectedBlock.reviewState === 'pending_confirmation' ? (
+          <span style={{ color: 'var(--warning-color)', fontSize: '0.82rem', fontWeight: 700 }}>
+            {t('taskEditor.pendingReviewHint')}
+          </span>
+        ) : null}
+      </div>
+
+      <div style={{ borderRadius: '12px', boxShadow: 'var(--neu-shadow-inset)', padding: '0.85rem 0.95rem', display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+        <div style={{ fontWeight: 700, fontSize: '0.88rem' }}>{t('taskDetail.inlineEditorSource')}</div>
+        <div style={{ color: 'var(--text-primary)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', lineHeight: 1.75, maxHeight: inlineEditorSideBySide ? '16rem' : '12rem', overflowY: 'auto' }}>
+          {selectedBlock.sourceMarkdown}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ fontWeight: 700, fontSize: '0.88rem' }}>{t('taskDetail.inlineEditorTranslation')}</div>
+          <div style={{ color: inlineSaveIndicator === 'error' ? 'var(--danger-color)' : inlineEditorDirty ? 'var(--warning-color)' : 'var(--text-secondary)', fontSize: '0.82rem', fontWeight: 600 }}>
+            {inlineSaveMessage
+              || (inlineEditorDirty
+                ? t('taskDetail.inlineEditorDirty')
+                : inlineLastSavedAt
+                  ? t('taskDetail.inlineEditorSavedAt', { time: new Date(inlineLastSavedAt).toLocaleTimeString(dateLocale) })
+                  : t('taskDetail.inlineEditorIdle'))}
+          </div>
+        </div>
+        {inlineEditorCanSave ? (
+          <textarea
+            className="glass-input"
+            value={inlineDraft}
+            onChange={(event) => {
+              setInlineDraft(event.target.value);
+              if (inlineSaveIndicator === 'error') {
+                setInlineSaveIndicator('idle');
+                setInlineSaveMessage('');
+              }
+            }}
+            placeholder={t('taskEditor.translationPlaceholder')}
+            style={{
+              minHeight: inlineEditorSideBySide ? '18rem' : '14rem',
+              resize: 'vertical',
+              lineHeight: 1.8,
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere'
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              borderRadius: '10px',
+              boxShadow: 'var(--neu-shadow-inset)',
+              padding: '0.9rem 1rem',
+              color: 'var(--text-secondary)',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              lineHeight: 1.8,
+              minHeight: '8rem'
+            }}
+          >
+            {selectedBlock.shouldTranslate ? t('taskEditor.blockBusy') : t('taskDetail.inlineEditorReadOnly')}
+          </div>
+        )}
+      </div>
+
+      {selectedBlockCandidateContainsInternalPlaceholders ? (
+        <div style={{ color: 'var(--warning-color)', fontSize: '0.84rem', lineHeight: 1.65 }}>
+          {t('taskEditor.placeholderHint')}
+        </div>
+      ) : null}
+      {selectedBlockErrorMessage ? (
+        <div style={{ color: 'var(--danger-color)', fontSize: '0.84rem', lineHeight: 1.65 }}>
+          {selectedBlockErrorMessage}
+        </div>
+      ) : null}
+
+      <div style={{ display: 'flex', gap: '0.55rem', flexWrap: 'wrap' }}>
+        <button className="glass-button primary" onClick={() => void saveInlineDraft('manual')} disabled={!inlineEditorCanSave || !inlineEditorDirty || inlineSaveIndicator === 'saving'}>
+          <Save size={15} /> {t('taskDetail.inlineEditorSave')}
+        </button>
+        <button className="glass-button" onClick={() => void handleRetranslate(selectedBlock.id)} disabled={actionBusy !== null || !selectedBlock.shouldTranslate}>
+          <RefreshCw size={15} /> {t('common.retry')}
+        </button>
+        <button className="glass-button" onClick={() => void handleReviewAction(selectedBlock.id, 'confirmed')} disabled={actionBusy !== null || !selectedBlockCanConfirmCandidate}>
+          {t('common.confirm')}
+        </button>
+        <button className="glass-button" onClick={() => void handleReviewAction(selectedBlock.id, 'ignored')} disabled={actionBusy !== null || !selectedBlock.shouldTranslate}>
+          {t('common.ignore')}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', height: '100%' }}>
-      {canUseSidebarRail && sidebarToolSlot ? createPortal(errorRail, sidebarToolSlot) : null}
+      {canUseSidebarTools && sidebarToolSlot ? createPortal(utilityPanels, sidebarToolSlot) : null}
       {!isFocusMode && (
         <>
           <div className="glass-panel" style={{ padding: '2rem', display: 'flex', flexWrap: 'wrap', gap: '2rem', alignItems: 'stretch' }}>
@@ -649,20 +1251,31 @@ export default function TaskDetail() {
                     </>
                   )}
                   {renderPrimaryAction()}
-                  <div ref={exportMenuRef} style={{ position: 'relative' }}>
-                    <button className="glass-button primary" onClick={() => setExportMenuOpen((value) => !value)} disabled={!canExport}>
-                      <Download size={16} /> {t('common.export')} <ChevronDown size={15} />
-                    </button>
-                    {exportMenuOpen && canExport && (
-                      <div style={{ position: 'absolute', top: 'calc(100% + 10px)', right: 0, minWidth: '220px', padding: '0.5rem', borderRadius: '14px', background: 'var(--bg-color-solid)', boxShadow: 'var(--neu-shadow)', display: 'flex', flexDirection: 'column', gap: '0.35rem', zIndex: 100 }}>
-                        {exportOptions.map((item) => (
-                          <button key={item.format} className="glass-button" style={{ justifyContent: 'flex-start', padding: '0.7rem 0.9rem' }} onClick={() => handleExport(item.format)}>
-                            {item.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                  {latestExportJob && (
+                    <span
+                      style={{
+                        padding: '0.35rem 0.7rem',
+                        borderRadius: '999px',
+                        fontSize: '0.8rem',
+                        fontWeight: 700,
+                        color: latestExportJob.status === 'failed'
+                          ? 'var(--danger-color)'
+                          : latestExportJob.canDownload
+                            ? 'var(--success-color)'
+                            : 'var(--primary-color)',
+                        background: latestExportJob.status === 'failed'
+                          ? 'rgba(239, 68, 68, 0.14)'
+                          : latestExportJob.canDownload
+                            ? 'rgba(16, 185, 129, 0.14)'
+                            : 'rgba(96, 165, 250, 0.14)'
+                      }}
+                    >
+                      {getExportStageLabel(latestExportJob)}
+                    </span>
+                  )}
+                  <button className="glass-button primary" onClick={() => setExportDialogOpen(true)} disabled={!canExport}>
+                    <Download size={16} /> {t('taskDetail.exportOpenDialog')}
+                  </button>
                 </div>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '1rem', background: 'var(--shadow-light)', padding: '1.2rem', borderRadius: '12px', boxShadow: 'var(--neu-shadow-inset)' }}>
@@ -706,23 +1319,11 @@ export default function TaskDetail() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600, flexWrap: 'wrap' }}>
                   <AlertTriangle size={20} className="text-danger" />
                   <span>{retryRailActive ? t('common.processing') : t('taskDetail.failed', { count: railCount || stats.failed })}</span>
-                  {!canUseSidebarRail && railBlocks.length > 0 && (
-                    <>
-                      <button className="glass-button" onClick={() => jumpToError('prev')} style={{ padding: '0.3rem 0.6rem', fontSize: '0.8rem' }}>
-                        <ChevronLeft size={14} /> {t('taskDetail.prevError')}
-                      </button>
-                      <button className="glass-button" onClick={() => jumpToError('next')} style={{ padding: '0.3rem 0.6rem', fontSize: '0.8rem' }}>
-                        <ChevronRight size={14} /> {t('taskDetail.nextError')}
-                      </button>
-                      <button className="glass-button" onClick={handleRetranslateFailed} disabled={actionBusy !== null || failedBlocks.length === 0} style={{ padding: '0.3rem 0.6rem', fontSize: '0.8rem' }}>
-                        <RefreshCw size={14} /> {t('taskDetail.retryAll')}
-                      </button>
-                    </>
-                  )}
                 </div>
               </div>
             </div>
           </div>
+          {shouldRenderInlineTools && utilityPanels}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem', background: 'var(--bg-color-solid)', borderRadius: '12px', boxShadow: 'var(--neu-shadow-sm)', flexWrap: 'wrap', gap: '1rem' }}>
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
               <button className={`glass-button ${displayMode === 'compare' ? 'primary' : ''}`} onClick={() => setDisplayMode('compare')} style={{ padding: '0.4rem 1rem' }}>
@@ -736,172 +1337,301 @@ export default function TaskDetail() {
               </button>
             </div>
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <button className={`glass-button ${viewMode === 'pagination' ? 'primary' : ''}`} onClick={() => { setViewMode('pagination'); setCurrentPage(1); }} style={{ padding: '0.4rem 1rem' }}>
+              <button className={`glass-button ${viewMode === 'pagination' ? 'primary' : ''}`} onClick={() => void changeViewMode('pagination')} style={{ padding: '0.4rem 1rem' }}>
                 {t('taskDetail.viewPagination')}
               </button>
-              <button className={`glass-button ${viewMode === 'scroll' ? 'primary' : ''}`} onClick={() => { setViewMode('scroll'); setScrollPagesLoaded(1); }} style={{ padding: '0.4rem 1rem' }}>
+              <button className={`glass-button ${viewMode === 'scroll' ? 'primary' : ''}`} onClick={() => void changeViewMode('scroll')} style={{ padding: '0.4rem 1rem' }}>
                 {t('taskDetail.viewScroll')}
               </button>
-              <button className="glass-button" onClick={() => setIsFocusMode(true)} style={{ padding: '0.4rem 1rem' }}>
+              <button className="glass-button" onClick={() => void toggleReadingMode(true)} style={{ padding: '0.4rem 1rem' }}>
                 <Maximize size={16} style={{ verticalAlign: 'middle', marginRight: '0.35rem' }} /> {t('taskDetail.focusMode')}
               </button>
             </div>
           </div>
-          {latestExportJob && (
-            <div className="glass-panel" style={{ padding: '1.1rem 1.2rem', borderRadius: '14px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.9rem' }}>
-                <div>
-                  <div style={{ fontWeight: 700 }}>{t('taskDetail.exportQueueTitle')}</div>
-                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.25rem' }}>
-                    {pendingDownloadJobId ? t('taskDetail.exportAutoDownloadWaiting') : t('taskDetail.exportQueueHint')}
-                  </div>
-                </div>
-                {hasActiveExportJobs && (
-                  <div style={{ color: 'var(--primary-color)', fontWeight: 600 }}>
-                    {t('common.processing')}
-                  </div>
-                )}
-              </div>
-              {(() => {
-                const job = latestExportJob;
-                const stageLabel = t(`taskDetail.exportStage.${job.progress.stage}`);
-                return (
-                  <div style={{ padding: '0.9rem 1rem', borderRadius: '12px', background: 'var(--shadow-light)', boxShadow: 'var(--neu-shadow-inset)', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                      <div>
-                        <div style={{ fontWeight: 700 }}>{getExportLabel(job.format)}</div>
-                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '0.2rem' }}>
-                          {getExportStatusLabel(job)} · {new Date(job.createdAt).toLocaleTimeString(dateLocale)}
-                        </div>
-                      </div>
-                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                        <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{stageLabel}</span>
-                        {job.canDownload && (
-                          <button className="glass-button primary" onClick={() => void handleExportJobDownload(job)} style={{ padding: '0.45rem 0.9rem' }}>
-                            <Download size={14} /> {t('taskDetail.exportDownload')}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    <div style={{ height: '10px', borderRadius: '999px', background: 'rgba(148, 163, 184, 0.18)', overflow: 'hidden' }}>
-                      <div style={{ width: `${job.progress.percent}%`, height: '100%', background: job.status === 'failed' ? 'var(--danger-color)' : 'var(--primary-color)', transition: 'width 0.3s ease' }} />
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                      <span>{job.progress.percent}%</span>
-                      {job.progress.detail ? <span>{job.progress.detail}</span> : null}
-                      {job.errorMessage ? <span className="text-danger">{job.errorMessage}</span> : null}
-                      {job.stale ? <span>{t('taskDetail.exportStaleHint')}</span> : null}
-                    </div>
-                  </div>
-                );
-              })()}
-            </div>
-          )}
         </>
       )}
       <div
-        className={isFocusMode ? '' : 'glass-panel'}
         style={
           isFocusMode
-            ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 999999, background: 'var(--bg-color-solid, var(--bg-color))', overflowY: 'auto', padding: '4rem 12%', display: 'flex', flexDirection: 'column' }
-            : { flex: 1, display: 'flex', flexDirection: 'column', padding: '2.5rem', overflowY: 'auto' }
+            ? { position: 'relative', flex: 1, minHeight: 0 }
+            : inlineEditorSideBySide
+              ? { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 420px', gap: '1rem', alignItems: 'start', flex: 1, minHeight: 0 }
+              : { display: 'flex', flexDirection: 'column', gap: '1rem', flex: 1, minHeight: 0 }
         }
       >
-        {isFocusMode && (
-          <button onClick={() => setIsFocusMode(false)} className="glass-button" style={{ position: 'fixed', top: '1rem', right: '1.5rem', zIndex: 10000, padding: '0.6rem 1.2rem' }}>
-            <Minimize size={16} style={{ verticalAlign: 'middle', marginRight: '0.35rem' }} /> {t('taskDetail.exitFocusMode')}
-          </button>
-        )}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem', fontSize: isFocusMode ? '1.2rem' : '1.05rem', lineHeight: 1.8 }}>
-          {visibleBlocks.map((block) => {
-            const candidateTranslation = block.reviewCandidateTranslation || '';
-            const reviewState = block.reviewState || 'none';
-            const canConfirmCandidate = reviewState === 'pending_confirmation' && Boolean(candidateTranslation);
-            const candidateContainsInternalPlaceholders = hasEpubInternalPlaceholders(candidateTranslation);
-            const blockErrorMessage = formatProviderAwareErrorMessage(block.errorMessage, status.providerLabel);
-            const { content, color, borderLeft } = renderTargetContent(block);
+        <div
+          className={isFocusMode ? '' : 'glass-panel'}
+          style={
+            isFocusMode
+              ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 999999, background: 'var(--bg-color-solid, var(--bg-color))', overflowY: 'auto', padding: '4rem 12%', display: 'flex', flexDirection: 'column' }
+              : { display: 'flex', flexDirection: 'column', padding: '2.5rem', overflowY: 'auto', minHeight: 0 }
+          }
+        >
+          {isFocusMode && (
+            <button onClick={() => void toggleReadingMode(false)} className="glass-button" style={{ position: 'fixed', top: '1rem', right: '1.5rem', zIndex: 10000, padding: '0.6rem 1.2rem' }}>
+              <Minimize size={16} style={{ verticalAlign: 'middle', marginRight: '0.35rem' }} /> {t('taskDetail.exitFocusMode')}
+            </button>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem', fontSize: isFocusMode ? '1.2rem' : '1.05rem', lineHeight: 1.8 }}>
+            {visibleBlocks.map((block) => {
+              const candidateTranslation = block.reviewCandidateTranslation || '';
+              const reviewState = block.reviewState || 'none';
+              const canConfirmCandidate = reviewState === 'pending_confirmation' && Boolean(candidateTranslation);
+              const candidateContainsInternalPlaceholders = hasEpubInternalPlaceholders(candidateTranslation);
+              const blockErrorMessage = formatProviderAwareErrorMessage(block.errorMessage, status.providerLabel);
+              const { content, color, borderLeft } = renderTargetContent(block);
+              const isSelected = !isFocusMode && selectedBlockId === block.id;
 
-            return (
-              <div key={block.id} ref={(node) => { blockNodeRefs.current[block.id] = node; }} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', minWidth: 0, maxWidth: '100%' }}>
-                {(displayMode === 'compare' || displayMode === 'source') && (
-                  <div style={{ color: 'var(--text-primary)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', maxWidth: '100%' }}>
-                    {block.sourceMarkdown}
-                  </div>
-                )}
-                {(displayMode === 'compare' || displayMode === 'target') && (
-                  <div
+              return (
+                <div
+                  key={block.id}
+                  ref={(node) => { blockNodeRefs.current[block.id] = node; }}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem',
+                    minWidth: 0,
+                    maxWidth: '100%',
+                    borderRadius: '14px',
+                    padding: !isFocusMode && isSelected ? '0.8rem 1rem' : !isFocusMode ? '0.55rem 0.7rem' : 0,
+                    background: !isFocusMode && isSelected ? 'rgba(96, 165, 250, 0.12)' : !isFocusMode ? 'rgba(255,255,255,0.03)' : 'transparent',
+                    boxShadow: !isFocusMode && isSelected ? 'var(--neu-shadow-inset)' : 'none',
+                    cursor: !isFocusMode ? 'pointer' : 'default',
+                    transition: 'background 0.2s ease, box-shadow 0.2s ease'
+                  }}
+                  onClick={() => {
+                    if (!isFocusMode) {
+                      void selectBlockForEditor(block.id);
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if (isFocusMode) {
+                      return;
+                    }
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      void selectBlockForEditor(block.id);
+                    }
+                  }}
+                  role={isFocusMode ? undefined : 'button'}
+                  tabIndex={isFocusMode ? -1 : 0}
+                  aria-pressed={isFocusMode ? undefined : isSelected}
+                >
+                  {(displayMode === 'compare' || displayMode === 'source') && (
+                    <div style={{ color: 'var(--text-primary)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', maxWidth: '100%' }}>
+                      {block.sourceMarkdown}
+                    </div>
+                  )}
+                  {(displayMode === 'compare' || displayMode === 'target') && (
+                    <div
+                      style={{
+                        color,
+                        borderLeft,
+                        paddingLeft: '1rem',
+                        whiteSpace: 'pre-wrap',
+                        overflowWrap: 'anywhere',
+                        wordBreak: 'break-word',
+                        maxWidth: '100%',
+                        minWidth: 0,
+                        overflowX: 'auto',
+                        background: displayMode === 'compare' ? 'rgba(0,0,0,0.02)' : 'transparent',
+                        borderRadius: '0 8px 8px 0',
+                        paddingTop: displayMode === 'compare' ? '0.5rem' : 0,
+                        paddingBottom: displayMode === 'compare' ? '0.5rem' : 0
+                      }}
+                    >
+                      {content}
+                      {block.status === 'failed' && blockErrorMessage && <div style={{ marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.9 }}>{blockErrorMessage}</div>}
+                      {block.status === 'failed' && candidateTranslation && !canConfirmCandidate && !candidateContainsInternalPlaceholders && (
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                          {t('taskDetail.rawCandidateHint')}
+                        </div>
+                      )}
+                      {block.status === 'failed' && candidateTranslation && !canConfirmCandidate && candidateContainsInternalPlaceholders && (
+                        <details style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                          <summary style={{ cursor: 'pointer' }} onClick={(event) => event.stopPropagation()}>{t('taskDetail.internalPlaceholderCandidate')}</summary>
+                          <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', maxHeight: '12rem', overflow: 'auto', margin: '0.5rem 0 0', padding: '0.75rem', borderRadius: '10px', background: 'rgba(15, 23, 42, 0.08)' }}>
+                            {candidateTranslation}
+                          </pre>
+                        </details>
+                      )}
+                      {block.status === 'failed' && (
+                        <div style={{ display: 'inline-flex', gap: '0.5rem', flexWrap: 'wrap', marginLeft: '1rem', verticalAlign: 'middle' }}>
+                          <button onClick={(event) => { event.stopPropagation(); void handleReviewAction(block.id, 'confirmed'); }} disabled={actionBusy !== null || !canConfirmCandidate} style={{ background: 'transparent', border: '1px solid var(--success-color)', borderRadius: '6px', color: 'var(--success-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
+                            {t('common.confirm')}
+                          </button>
+                          <button onClick={(event) => { event.stopPropagation(); void handleReviewAction(block.id, 'ignored'); }} disabled={actionBusy !== null} style={{ background: 'transparent', border: '1px solid var(--warning-color)', borderRadius: '6px', color: 'var(--warning-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
+                            {t('common.ignore')}
+                          </button>
+                          <button onClick={(event) => { event.stopPropagation(); void handleRetranslate(block.id); }} disabled={actionBusy !== null} style={{ background: 'transparent', border: '1px solid var(--danger-color)', borderRadius: '6px', color: 'var(--danger-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
+                            {t('common.retry')}
+                          </button>
+                        </div>
+                      )}
+                      {block.status === 'failed' && reviewState === 'ignored' && (
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', opacity: 0.85 }}>{t('common.ignore')}</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {viewMode === 'pagination' && totalPages > 1 && (
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginTop: '1rem', paddingTop: '1.5rem', borderTop: '2px solid var(--shadow-light)', alignItems: 'center' }}>
+                <button className="glass-button" disabled={currentPage === 1} onClick={() => void changePage(Math.max(1, currentPage - 1))} style={{ padding: '0.6rem 1.25rem' }}>
+                  {t('taskDetail.previousPage')}
+                </button>
+                <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>{currentPage} / {totalPages}</span>
+                <button className="glass-button primary" disabled={currentPage === totalPages} onClick={() => void changePage(Math.min(totalPages, currentPage + 1))} style={{ padding: '0.6rem 1.25rem' }}>
+                  {t('taskDetail.nextPage')}
+                </button>
+              </div>
+            )}
+            {viewMode === 'scroll' && scrollPagesLoaded < totalPages && (
+              <div style={{ display: 'flex', justifyContent: 'center', marginTop: '1rem', paddingTop: '1.5rem', borderTop: '2px solid var(--shadow-light)' }}>
+                <button className="glass-button primary" onClick={handleLoadMore} disabled={actionBusy !== null} style={{ padding: '0.75rem 1.5rem' }}>
+                  {t('taskDetail.loadMore', { current: scrollPagesLoaded, total: totalPages })}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+        {inlineEditorSideBySide ? inlineEditorPanel : null}
+      </div>
+      {!isFocusMode && !inlineEditorSideBySide ? inlineEditorPanel : null}
+      {exportDialogOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(15, 23, 42, 0.42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '1.5rem',
+            zIndex: 1000000
+          }}
+          onClick={() => setExportDialogOpen(false)}
+        >
+          <div
+            className="glass-panel"
+            style={{
+              width: '100%',
+              maxWidth: '760px',
+              padding: '1.5rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '1.25rem'
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: '1.35rem' }}>{t('taskDetail.exportDialogTitle')}</h2>
+                <p style={{ margin: '0.65rem 0 0', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+                  {t('taskDetail.exportDialogDescription')}
+                </p>
+              </div>
+              <button className="glass-button" onClick={() => setExportDialogOpen(false)}>
+                {t('common.cancel')}
+              </button>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.9rem' }}>
+              {exportFamilies.map((item) => {
+                const active = selectedExportFamily === item.family;
+                return (
+                  <button
+                    key={item.family}
+                    type="button"
+                    className={`glass-button ${active ? 'primary' : ''}`}
+                    onClick={() => setSelectedExportFamily(item.family)}
                     style={{
-                      color,
-                      borderLeft,
-                      paddingLeft: '1rem',
-                      whiteSpace: 'pre-wrap',
-                      overflowWrap: 'anywhere',
-                      wordBreak: 'break-word',
-                      maxWidth: '100%',
-                      minWidth: 0,
-                      overflowX: 'auto',
-                      background: displayMode === 'compare' ? 'rgba(0,0,0,0.02)' : 'transparent',
-                      borderRadius: '0 8px 8px 0',
-                      paddingTop: displayMode === 'compare' ? '0.5rem' : 0,
-                      paddingBottom: displayMode === 'compare' ? '0.5rem' : 0
+                      padding: '1rem',
+                      justifyContent: 'flex-start',
+                      textAlign: 'left',
+                      flexDirection: 'column',
+                      alignItems: 'flex-start',
+                      gap: '0.45rem',
+                      minHeight: '132px',
+                      boxShadow: active ? 'var(--neu-shadow-inset)' : 'var(--neu-shadow-sm)'
                     }}
                   >
-                    {content}
-                    {block.status === 'failed' && blockErrorMessage && <div style={{ marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.9 }}>{blockErrorMessage}</div>}
-                    {block.status === 'failed' && candidateTranslation && !canConfirmCandidate && !candidateContainsInternalPlaceholders && (
-                      <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                        {t('taskDetail.rawCandidateHint')}
-                      </div>
-                    )}
-                    {block.status === 'failed' && candidateTranslation && !canConfirmCandidate && candidateContainsInternalPlaceholders && (
-                      <details style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                        <summary style={{ cursor: 'pointer' }}>{t('taskDetail.internalPlaceholderCandidate')}</summary>
-                        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', maxHeight: '12rem', overflow: 'auto', margin: '0.5rem 0 0', padding: '0.75rem', borderRadius: '10px', background: 'rgba(15, 23, 42, 0.08)' }}>
-                          {candidateTranslation}
-                        </pre>
-                      </details>
-                    )}
-                    {block.status === 'failed' && (
-                      <div style={{ display: 'inline-flex', gap: '0.5rem', flexWrap: 'wrap', marginLeft: '1rem', verticalAlign: 'middle' }}>
-                        <button onClick={() => handleReviewAction(block.id, 'confirmed')} disabled={actionBusy !== null || !canConfirmCandidate} style={{ background: 'transparent', border: '1px solid var(--success-color)', borderRadius: '6px', color: 'var(--success-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
-                          {t('common.confirm')}
-                        </button>
-                        <button onClick={() => handleReviewAction(block.id, 'ignored')} disabled={actionBusy !== null} style={{ background: 'transparent', border: '1px solid var(--warning-color)', borderRadius: '6px', color: 'var(--warning-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
-                          {t('common.ignore')}
-                        </button>
-                        <button onClick={() => handleRetranslate(block.id)} disabled={actionBusy !== null} style={{ background: 'transparent', border: '1px solid var(--danger-color)', borderRadius: '6px', color: 'var(--danger-color)', cursor: 'pointer', padding: '2px 8px', fontSize: '0.8rem' }}>
-                          {t('common.retry')}
-                        </button>
-                      </div>
-                    )}
-                    {block.status === 'failed' && reviewState === 'ignored' && (
-                      <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', opacity: 0.85 }}>{t('common.ignore')}</div>
-                    )}
-                  </div>
-                )}
+                    <span style={{ fontWeight: 700 }}>{item.label}</span>
+                    <span style={{ fontSize: '0.88rem', lineHeight: 1.6, color: 'var(--text-secondary)' }}>{item.description}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="glass-panel" style={{ padding: '1rem 1.1rem', boxShadow: 'var(--neu-shadow-inset)' }}>
+              <div style={{ fontWeight: 700, marginBottom: '0.75rem' }}>{t('taskDetail.exportLayoutTitle')}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem' }}>
+                {([
+                  { value: 'translation-only', label: t('taskDetail.exportLayout.translationOnly'), hint: t('taskDetail.exportLayout.translationOnlyHint') },
+                  { value: 'bilingual', label: t('taskDetail.exportLayout.bilingual'), hint: t('taskDetail.exportLayout.bilingualHint') }
+                ] as Array<{ value: ExportLayout; label: string; hint: string }>).map((item) => {
+                  const active = selectedExportLayout === item.value;
+                  return (
+                    <button
+                      key={item.value}
+                      type="button"
+                      className={`glass-button ${active ? 'primary' : ''}`}
+                      onClick={() => setSelectedExportLayout(item.value)}
+                      style={{
+                        justifyContent: 'flex-start',
+                        textAlign: 'left',
+                        flexDirection: 'column',
+                        alignItems: 'flex-start',
+                        padding: '0.9rem 1rem',
+                        gap: '0.35rem',
+                        boxShadow: active ? 'var(--neu-shadow-inset)' : 'var(--neu-shadow-sm)'
+                      }}
+                    >
+                      <span style={{ fontWeight: 700 }}>{item.label}</span>
+                      <span style={{ fontSize: '0.84rem', lineHeight: 1.55, color: 'var(--text-secondary)' }}>{item.hint}</span>
+                    </button>
+                  );
+                })}
               </div>
-            );
-          })}
-          {viewMode === 'pagination' && totalPages > 1 && (
-            <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginTop: '1rem', paddingTop: '1.5rem', borderTop: '2px solid var(--shadow-light)', alignItems: 'center' }}>
-              <button className="glass-button" disabled={currentPage === 1} onClick={() => setCurrentPage((page) => page - 1)} style={{ padding: '0.6rem 1.25rem' }}>
-                {t('taskDetail.previousPage')}
+            </div>
+
+            <label
+              className="glass-panel"
+              style={{
+                padding: '0.95rem 1rem',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.75rem',
+                boxShadow: 'var(--neu-shadow-inset)',
+                cursor: 'pointer'
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={exportAutoDownload}
+                onChange={(event) => setExportAutoDownload(event.target.checked)}
+                style={{ width: '18px', height: '18px' }}
+              />
+              <div>
+                <div style={{ fontWeight: 700 }}>{t('taskDetail.exportAutoDownloadLabel')}</div>
+                <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', marginTop: '0.15rem', lineHeight: 1.55 }}>
+                  {t('taskDetail.exportAutoDownloadHint')}
+                </div>
+              </div>
+            </label>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <button className="glass-button" onClick={() => setExportDialogOpen(false)}>
+                {t('common.cancel')}
               </button>
-              <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>{currentPage} / {totalPages}</span>
-              <button className="glass-button primary" disabled={currentPage === totalPages} onClick={() => setCurrentPage((page) => page + 1)} style={{ padding: '0.6rem 1.25rem' }}>
-                {t('taskDetail.nextPage')}
+              <button className="glass-button primary" onClick={() => void handleExportSubmit()} disabled={!canExport}>
+                <Download size={16} /> {t('taskDetail.exportStartAction')}
               </button>
             </div>
-          )}
-          {viewMode === 'scroll' && scrollPagesLoaded < totalPages && (
-            <div style={{ display: 'flex', justifyContent: 'center', marginTop: '1rem', paddingTop: '1.5rem', borderTop: '2px solid var(--shadow-light)' }}>
-              <button className="glass-button primary" onClick={handleLoadMore} disabled={actionBusy !== null} style={{ padding: '0.75rem 1.5rem' }}>
-                {t('taskDetail.loadMore', { current: scrollPagesLoaded, total: totalPages })}
-              </button>
-            </div>
-          )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

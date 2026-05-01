@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { readFile as readFileAsync, rm as rmAsync, writeFile as writeFileAsync } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
   BLOCK_PROMPT_TEMPLATE,
@@ -14,22 +15,524 @@ import { resolveExportLanguage } from "./export-language.js";
 import { mergeMarkdown, parseMarkdownDocument } from "./markdown.js";
 import { buildPdfExport } from "./pdf-export.js";
 import { buildEpubExport, parseEpubArchive, removeTaskArtifacts, reparseEpubArchive } from "./epub-service.js";
+import { buildMarkdownEpubExport } from "./markdown-epub-export.js";
 import { applyEpubPlaceholderBestEffortTranslation, applyEpubPlaceholderTranslation, applyEpubTranslationUnit, buildEpubPlaceholderPlan, buildEpubPreviewFromNormalizedFragment } from "./epub-hotpath.js";
-import { testChatCompletionsConnection, translateWithDeepSeek } from "./translation-provider.js";
+import { normalizeApiProtocol, testProviderConnection as runProviderConnectionTest, translateWithProvider } from "./translation-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "../..");
-const DEFAULT_DB_PATH = path.join(__dirname, "../data/db.json");
-const DB_PATH = process.env.MARKDOWN_TRANSLATOR_DB_PATH
-  ? path.resolve(process.env.MARKDOWN_TRANSLATOR_DB_PATH)
-  : DEFAULT_DB_PATH;
-const DOTENV_PATH = path.join(ROOT_DIR, ".env");
+const DEFAULT_SQLITE_PATH = path.join(__dirname, "../data/app.sqlite");
+const DEFAULT_LEGACY_JSON_PATH = path.join(__dirname, "../data/db.json");
+
+function resolveStatePath(inputPath, fallbackPath) {
+  const trimmed = typeof inputPath === "string" ? inputPath.trim() : "";
+  if (!trimmed) {
+    return fallbackPath;
+  }
+  if (trimmed === ":memory:") {
+    return trimmed;
+  }
+  return path.resolve(trimmed);
+}
+
+const CONFIGURED_STATE_PATH = resolveStatePath(process.env.MARKDOWN_TRANSLATOR_DB_PATH, DEFAULT_SQLITE_PATH);
+const DB_PATH = CONFIGURED_STATE_PATH.endsWith(".json")
+  ? CONFIGURED_STATE_PATH.replace(/\.json$/i, ".sqlite")
+  : CONFIGURED_STATE_PATH;
+const LEGACY_JSON_STATE_PATH = CONFIGURED_STATE_PATH.endsWith(".json")
+  ? CONFIGURED_STATE_PATH
+  : DB_PATH === DEFAULT_SQLITE_PATH
+    ? DEFAULT_LEGACY_JSON_PATH
+    : "";
+const configuredDotenvPath =
+  typeof process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH === "string" ? process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH.trim() : "";
+const DOTENV_PATH = configuredDotenvPath
+  ? path.resolve(path.isAbsolute(configuredDotenvPath) ? configuredDotenvPath : path.join(ROOT_DIR, configuredDotenvPath))
+  : path.join(ROOT_DIR, ".env");
 const DEFAULT_EXPORT_CACHE_DIR = path.join(__dirname, "../data/export-cache");
 const CONFIGURED_EXPORT_CACHE_DIR = process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR
   ? path.resolve(process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR)
   : DEFAULT_EXPORT_CACHE_DIR;
 const FALLBACK_EXPORT_CACHE_DIR = path.join(os.tmpdir(), "translate-book-export-cache");
 let resolvedExportCacheDir = "";
+let stateDb = null;
+const dirtyTaskIds = new Set();
+const dirtyBlockKeys = new Set();
+const replacedTaskBlockIds = new Set();
+const deletedTaskIds = new Set();
+const dirtyExportJobTaskIds = new Set();
+let settingsDirty = false;
+let secretsDirty = false;
+
+function buildDirtyBlockKey(taskId, blockId) {
+  return `${taskId}\u0000${blockId}`;
+}
+
+function parseDirtyBlockKey(key) {
+  const [taskId = "", blockId = ""] = String(key || "").split("\u0000");
+  return { taskId, blockId };
+}
+
+function clearDirtyBlocksForTask(taskId) {
+  for (const key of dirtyBlockKeys) {
+    if (key.startsWith(`${taskId}\u0000`)) {
+      dirtyBlockKeys.delete(key);
+    }
+  }
+}
+
+function taskHasDirtyBlocks(taskId) {
+  if (replacedTaskBlockIds.has(taskId)) {
+    return true;
+  }
+  for (const key of dirtyBlockKeys) {
+    if (key.startsWith(`${taskId}\u0000`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasPendingPersistence(taskId = "") {
+  if (taskId) {
+    return (
+      dirtyTaskIds.has(taskId) ||
+      deletedTaskIds.has(taskId) ||
+      dirtyExportJobTaskIds.has(taskId) ||
+      replacedTaskBlockIds.has(taskId) ||
+      taskHasDirtyBlocks(taskId)
+    );
+  }
+
+  return (
+    dirtyTaskIds.size > 0 ||
+    dirtyBlockKeys.size > 0 ||
+    replacedTaskBlockIds.size > 0 ||
+    deletedTaskIds.size > 0 ||
+    dirtyExportJobTaskIds.size > 0 ||
+    settingsDirty ||
+    secretsDirty
+  );
+}
+
+function ensureStateStoreDirectory(filePath) {
+  if (!filePath || filePath === ":memory:") {
+    return;
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function ensureTableColumn(db, tableName, columnName, ddl) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (columns.some((column) => column.name === columnName)) {
+    return;
+  }
+  db.exec(ddl);
+}
+
+function getStateDb() {
+  if (stateDb) {
+    return stateDb;
+  }
+
+  ensureStateStoreDirectory(DB_PATH);
+  const db = new DatabaseSync(DB_PATH, { timeout: 5000 });
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    CREATE TABLE IF NOT EXISTS metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      updated_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      summary_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS task_blocks (
+      task_id TEXT NOT NULL,
+      block_id TEXT NOT NULL,
+      order_index INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      source_text TEXT NOT NULL DEFAULT '',
+      translated_text TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(task_id, block_id)
+    );
+    CREATE TABLE IF NOT EXISTS task_export_jobs (
+      task_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(task_id, job_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_task_blocks_task_order ON task_blocks(task_id, order_index ASC);
+    CREATE INDEX IF NOT EXISTS idx_task_export_jobs_task_created ON task_export_jobs(task_id, created_at DESC, updated_at DESC);
+    CREATE VIRTUAL TABLE IF NOT EXISTS task_blocks_fts USING fts5(
+      task_id UNINDEXED,
+      block_id UNINDEXED,
+      source_text,
+      translated_text,
+      tokenize='unicode61'
+    );
+  `);
+
+  stateDb = db;
+  ensureTableColumn(stateDb, "tasks", "summary_json", "ALTER TABLE tasks ADD COLUMN summary_json TEXT NOT NULL DEFAULT '{}'");
+  migrateLegacyJsonStateIfNeeded(stateDb);
+  migrateTaskBlocksSchemaIfNeeded(stateDb);
+  return stateDb;
+}
+
+function closeStateDb() {
+  if (!stateDb) {
+    return;
+  }
+  try {
+    stateDb.close();
+  } catch {
+    // Ignore shutdown-time close errors.
+  } finally {
+    stateDb = null;
+  }
+}
+
+function stateStoreHasRows(db) {
+  const taskCount = Number(db.prepare("SELECT COUNT(*) AS count FROM tasks").get()?.count || 0);
+  const metadataCount = Number(db.prepare("SELECT COUNT(*) AS count FROM metadata").get()?.count || 0);
+  return taskCount > 0 || metadataCount > 0;
+}
+
+function readLegacyJsonState() {
+  if (!LEGACY_JSON_STATE_PATH || LEGACY_JSON_STATE_PATH === ":memory:" || !fs.existsSync(LEGACY_JSON_STATE_PATH)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(LEGACY_JSON_STATE_PATH, "utf8"));
+  } catch (error) {
+    console.error("Failed to read legacy JSON state", error);
+    return null;
+  }
+}
+
+function migrateLegacyJsonStateIfNeeded(db) {
+  if (stateStoreHasRows(db)) {
+    return;
+  }
+
+  const legacyData = readLegacyJsonState();
+  if (!legacyData) {
+    return;
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const upsertMeta = db.prepare(`
+      INSERT INTO metadata(key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    const insertTask = db.prepare(`
+      INSERT INTO tasks(id, updated_at, payload_json, summary_json)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        payload_json = excluded.payload_json,
+        summary_json = excluded.summary_json
+    `);
+
+    upsertMeta.run("app_settings", JSON.stringify(legacyData.appSettings || {}));
+    for (const task of Array.isArray(legacyData.tasks) ? legacyData.tasks : []) {
+      if (!task?.id) {
+        continue;
+      }
+      insertTask.run(
+        task.id,
+        task.updatedAt || task.createdAt || new Date().toISOString(),
+        JSON.stringify(task),
+        JSON.stringify(task.summary || {})
+      );
+    }
+    db.exec("COMMIT");
+    console.info(`Migrated legacy JSON state into SQLite: ${path.relative(ROOT_DIR, DB_PATH)}`);
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore rollback errors.
+    }
+    throw error;
+  }
+}
+
+function parsePersistedSummary(summaryJson) {
+  try {
+    const parsed = JSON.parse(summaryJson || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasPersistedSummary(summaryJson) {
+  const summary = parsePersistedSummary(summaryJson);
+  return Boolean(summary && Number.isInteger(summary.totalBlocks) && typeof summary.stage === "string" && summary.stage);
+}
+
+function markTaskDirty(taskId) {
+  if (!taskId) {
+    return;
+  }
+  deletedTaskIds.delete(taskId);
+  dirtyTaskIds.add(taskId);
+}
+
+function markTaskBlockDirty(taskId, blockId) {
+  if (!taskId || !blockId) {
+    return;
+  }
+  deletedTaskIds.delete(taskId);
+  dirtyBlockKeys.add(buildDirtyBlockKey(taskId, blockId));
+}
+
+function markTaskBlocksReplaced(taskId) {
+  if (!taskId) {
+    return;
+  }
+  deletedTaskIds.delete(taskId);
+  replacedTaskBlockIds.add(taskId);
+  clearDirtyBlocksForTask(taskId);
+}
+
+function markTaskExportJobsDirty(taskId) {
+  if (!taskId) {
+    return;
+  }
+  deletedTaskIds.delete(taskId);
+  dirtyExportJobTaskIds.add(taskId);
+}
+
+function markTaskDeleted(taskId) {
+  if (!taskId) {
+    return;
+  }
+  dirtyTaskIds.delete(taskId);
+  dirtyExportJobTaskIds.delete(taskId);
+  replacedTaskBlockIds.delete(taskId);
+  clearDirtyBlocksForTask(taskId);
+  deletedTaskIds.add(taskId);
+}
+
+function serializeTaskForPersistence(task) {
+  const nextTask = structuredClone(task);
+  nextTask.config = normalizePersistedSettings(nextTask.config);
+  nextTask.exports = {};
+  nextTask.summary = null;
+  delete nextTask.blocks;
+  delete nextTask.exportJobs;
+  if (nextTask.runtime && typeof nextTask.runtime === "object") {
+    nextTask.runtime.pendingQueue = [];
+  }
+  return nextTask;
+}
+
+function serializeTaskSummaryForPersistence(task) {
+  return JSON.stringify(task.summary || buildSummary(task));
+}
+
+function serializeBlockForPersistence(task, block) {
+  const nextBlock = structuredClone(block);
+  nextBlock.promptSnapshot = null;
+  nextBlock.annotations = Array.isArray(nextBlock.annotations) ? nextBlock.annotations : [];
+  nextBlock.comments = Array.isArray(nextBlock.comments) ? nextBlock.comments : [];
+  nextBlock.translationUnit = normalizeEpubTranslationUnit(nextBlock.translationUnit);
+  return {
+    taskId: task.id,
+    blockId: nextBlock.id,
+    orderIndex: Number.isInteger(nextBlock.order) ? nextBlock.order : 0,
+    updatedAt: task.updatedAt || task.createdAt || now(),
+    sourceText: getSerializedSourceMarkdown(nextBlock),
+    translatedText: getSerializedTranslatedMarkdown(nextBlock),
+    payloadJson: JSON.stringify(nextBlock)
+  };
+}
+
+function serializeExportJobForPersistence(taskId, job) {
+  const normalized = normalizePersistedExportJob(job);
+  return {
+    taskId,
+    jobId: normalized.id,
+    createdAt: normalized.createdAt || now(),
+    updatedAt: normalized.finishedAt || normalized.startedAt || normalized.createdAt || now(),
+    payloadJson: JSON.stringify(normalized)
+  };
+}
+
+function hydrateTaskRecord(taskPayload, blockRows = [], exportJobRows = []) {
+  const t = taskPayload;
+  if (t?.config) {
+    if (
+      (typeof t.config.apiKey === "string" && t.config.apiKey.trim()) ||
+      (typeof t.config.accessToken === "string" && t.config.accessToken.trim())
+    ) {
+      pendingStateSanitize = true;
+    }
+    t.config = normalizePersistedSettings(t.config);
+  } else {
+    t.config = normalizePersistedSettings();
+  }
+  t.documentFormat = t.documentFormat || "markdown";
+  t.asset = t.asset || null;
+  t.contentVersion = typeof t.contentVersion === "string" && t.contentVersion ? t.contentVersion : (t.updatedAt || t.createdAt || now());
+  t.blocks = blockRows.map((row) => JSON.parse(row.payload_json));
+  if (Array.isArray(t.blocks)) {
+    for (const block of t.blocks) {
+      block.promptSnapshot = null;
+      block.annotations = Array.isArray(block.annotations) ? block.annotations : [];
+      block.comments = Array.isArray(block.comments) ? block.comments : [];
+      block.translationUnit = normalizeEpubTranslationUnit(block.translationUnit);
+      if (activeStatus(block.status)) {
+        block.status = "paused";
+        block.errorMessage = "";
+        block.reviewErrorMessage = "";
+      }
+    }
+  }
+  t.annotations = Array.isArray(t.annotations) ? t.annotations : [];
+  t.comments = Array.isArray(t.comments) ? t.comments : [];
+  t.activity = Array.isArray(t.activity) ? t.activity : [];
+  const persistedExportJobs = exportJobRows.length
+    ? exportJobRows.map((row) => normalizePersistedExportJob(JSON.parse(row.payload_json)))
+    : (Array.isArray(t.exportJobs) ? t.exportJobs.map((job) => normalizePersistedExportJob(job)) : []);
+  t.exportJobs = persistedExportJobs;
+  t.runtime = t.runtime && typeof t.runtime === "object" ? t.runtime : { sessionStartedAt: "", pendingQueue: [] };
+  t.runtime.sessionStartedAt = typeof t.runtime.sessionStartedAt === "string" ? t.runtime.sessionStartedAt : "";
+  t.runtime.pendingQueue = [];
+  t.summary = buildSummary(t);
+  t.exports = {};
+  return t;
+}
+
+function migrateTaskBlocksSchemaIfNeeded(db) {
+  const taskCount = Number(db.prepare("SELECT COUNT(*) AS count FROM tasks").get()?.count || 0);
+  if (!taskCount) {
+    return;
+  }
+
+  const taskRows = db.prepare("SELECT id, updated_at, payload_json, summary_json FROM tasks").all();
+  const upsertTask = db.prepare(`
+    INSERT INTO tasks(id, updated_at, payload_json, summary_json)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      payload_json = excluded.payload_json,
+      summary_json = excluded.summary_json
+  `);
+  const selectBlocks = db.prepare(`
+    SELECT task_id, payload_json
+    FROM task_blocks
+    WHERE task_id = ?
+    ORDER BY order_index ASC
+  `);
+  const selectExportJobs = db.prepare(`
+    SELECT task_id, payload_json
+    FROM task_export_jobs
+    WHERE task_id = ?
+    ORDER BY created_at DESC, updated_at DESC
+  `);
+  const deleteBlocks = db.prepare("DELETE FROM task_blocks WHERE task_id = ?");
+  const deleteFts = db.prepare("DELETE FROM task_blocks_fts WHERE task_id = ?");
+  const insertBlock = db.prepare(`
+    INSERT INTO task_blocks(task_id, block_id, order_index, updated_at, source_text, translated_text, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertFts = db.prepare(`
+    INSERT INTO task_blocks_fts(task_id, block_id, source_text, translated_text)
+    VALUES (?, ?, ?, ?)
+  `);
+  const deleteExportJobs = db.prepare("DELETE FROM task_export_jobs WHERE task_id = ?");
+  const insertExportJob = db.prepare(`
+    INSERT INTO task_export_jobs(task_id, job_id, created_at, updated_at, payload_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const row of taskRows) {
+      const parsedTask = JSON.parse(row.payload_json);
+      const legacyBlocks = Array.isArray(parsedTask?.blocks) ? parsedTask.blocks : null;
+      const hasLegacyBlocks = Array.isArray(legacyBlocks);
+      const hasLegacyExportJobs = Array.isArray(parsedTask?.exportJobs);
+      const needsSummaryBackfill = !hasPersistedSummary(row.summary_json);
+
+      if (!hasLegacyBlocks && !hasLegacyExportJobs && !needsSummaryBackfill) {
+        continue;
+      }
+
+      if (hasLegacyBlocks) {
+        deleteBlocks.run(parsedTask.id);
+        deleteFts.run(parsedTask.id);
+        for (const block of legacyBlocks) {
+          const serializedBlock = serializeBlockForPersistence(parsedTask, block);
+          insertBlock.run(
+            serializedBlock.taskId,
+            serializedBlock.blockId,
+            serializedBlock.orderIndex,
+            serializedBlock.updatedAt,
+            serializedBlock.sourceText,
+            serializedBlock.translatedText,
+            serializedBlock.payloadJson
+          );
+          insertFts.run(
+            serializedBlock.taskId,
+            serializedBlock.blockId,
+            serializedBlock.sourceText,
+            serializedBlock.translatedText
+          );
+        }
+      }
+
+      if (hasLegacyExportJobs) {
+        deleteExportJobs.run(parsedTask.id);
+        for (const job of parsedTask.exportJobs) {
+          const serializedJob = serializeExportJobForPersistence(parsedTask.id, job);
+          insertExportJob.run(
+            serializedJob.taskId,
+            serializedJob.jobId,
+            serializedJob.createdAt,
+            serializedJob.updatedAt,
+            serializedJob.payloadJson
+          );
+        }
+      }
+
+      const hydratedTask = hydrateTaskRecord(
+        parsedTask,
+        hasLegacyBlocks ? legacyBlocks.map((block) => ({ payload_json: JSON.stringify(block) })) : selectBlocks.all(parsedTask.id),
+        hasLegacyExportJobs ? parsedTask.exportJobs.map((job) => ({ payload_json: JSON.stringify(job) })) : selectExportJobs.all(parsedTask.id)
+      );
+      const serializedTask = serializeTaskForPersistence(hydratedTask);
+      upsertTask.run(
+        parsedTask.id,
+        parsedTask.updatedAt || row.updated_at || parsedTask.createdAt || now(),
+        JSON.stringify(serializedTask),
+        serializeTaskSummaryForPersistence(hydratedTask)
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore rollback errors.
+    }
+    throw error;
+  }
+}
 
 export const SERVICE_INFO = {
   name: "Markdown and EPUB Translator Backend",
@@ -64,7 +567,13 @@ const LEGACY_API_KEY_DOTENV_KEYS = ["DEEPSEEK_API_KEY", "TRANSLATOR_API_KEY"];
 const DOTENV_API_KEY_KEYS = [MANAGED_API_KEY_DOTENV_KEY, ...LEGACY_API_KEY_DOTENV_KEYS];
 const MANAGED_ACCESS_TOKEN_DOTENV_KEY = "MARKDOWN_TRANSLATOR_ACCESS_TOKEN";
 const DOTENV_ACCESS_TOKEN_KEYS = [MANAGED_ACCESS_TOKEN_DOTENV_KEY];
+const PERSISTED_API_KEY_META_KEY = "secret_api_key";
+const PERSISTED_ACCESS_TOKEN_META_KEY = "secret_access_token";
 const runtimeSecrets = {
+  apiKey: "",
+  accessToken: ""
+};
+const persistedSecrets = {
   apiKey: "",
   accessToken: ""
 };
@@ -193,6 +702,7 @@ function writeDotenvEntries(entries) {
   if (content && !content.endsWith("\n")) {
     content += "\n";
   }
+  fs.mkdirSync(path.dirname(DOTENV_PATH), { recursive: true });
   fs.writeFileSync(DOTENV_PATH, content, "utf8");
 }
 
@@ -360,18 +870,100 @@ function clearManagedAccessTokenFromDotenv() {
   writeDotenvEntries(nextEntries);
 }
 
-function getResolvedApiKey() {
-  if (runtimeSecrets.apiKey) {
-    return {
-      value: runtimeSecrets.apiKey,
-      source: "session",
-      storageKey: "",
-      storageScope: "memory-only"
-    };
+function normalizePersistedSecretValue(value = "") {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function setPersistedSecret(secretKey, value) {
+  const normalized = normalizePersistedSecretValue(value);
+  if (persistedSecrets[secretKey] === normalized) {
+    return;
+  }
+  persistedSecrets[secretKey] = normalized;
+  secretsDirty = true;
+}
+
+function activateManagedApiKeyForCurrentProcess(apiKey) {
+  const normalized = normalizePersistedSecretValue(apiKey);
+  if (normalized) {
+    process.env[MANAGED_API_KEY_DOTENV_KEY] = normalized;
+    return;
+  }
+
+  delete process.env[MANAGED_API_KEY_DOTENV_KEY];
+}
+
+function persistApiKeyToPermanentEnv(apiKey) {
+  const normalized = normalizePersistedSecretValue(apiKey);
+  runtimeSecrets.apiKey = "";
+
+  if (!normalized) {
+    clearManagedApiKeyFromDotenv();
+    activateManagedApiKeyForCurrentProcess("");
+    setPersistedSecret("apiKey", "");
+    return;
+  }
+
+  writeManagedApiKeyToDotenv(normalized);
+  const persistedValue = getDotenvApiKey().value;
+  if (persistedValue !== normalized) {
+    throw createError(500, "dotenv_persist_failed", "Failed to persist API key to the local .env file.");
+  }
+
+  activateManagedApiKeyForCurrentProcess(normalized);
+  setPersistedSecret("apiKey", "");
+}
+
+function migrateLegacyApiKeyPersistenceToDotenv() {
+  const persistedApiKey = normalizePersistedSecretValue(persistedSecrets.apiKey);
+  if (!persistedApiKey) {
+    return;
   }
 
   const processEnvSecret = getProcessEnvApiKey();
+  const dotenvSecret = processEnvSecret.value ? { value: "" } : getDotenvApiKey();
+  const existingExternalApiKey = normalizePersistedSecretValue(processEnvSecret.value || dotenvSecret.value);
+
+  if (!existingExternalApiKey) {
+    try {
+      writeManagedApiKeyToDotenv(persistedApiKey);
+      activateManagedApiKeyForCurrentProcess(persistedApiKey);
+      console.info(`Migrated persisted API key from SQLite metadata into ${path.relative(ROOT_DIR, DOTENV_PATH)}.`);
+    } catch (error) {
+      console.error("Failed to migrate persisted API key into .env; keeping SQLite fallback for this startup.", error);
+      return;
+    }
+  }
+
+  setPersistedSecret("apiKey", "");
+}
+
+function persistMetadataSecret(upsertMeta, deleteMeta, key, value) {
+  const normalized = normalizePersistedSecretValue(value);
+  if (normalized) {
+    upsertMeta.run(key, normalized);
+    return;
+  }
+  deleteMeta.run(key);
+}
+
+function getResolvedApiKey() {
+  const processEnvSecret = getProcessEnvApiKey();
+  const dotenvSecret = getDotenvApiKey();
   if (processEnvSecret.value) {
+    if (
+      dotenvSecret.value &&
+      processEnvSecret.storageKey === MANAGED_API_KEY_DOTENV_KEY &&
+      processEnvSecret.value === dotenvSecret.value
+    ) {
+      return {
+        value: dotenvSecret.value,
+        source: "dotenv",
+        storageKey: dotenvSecret.storageKey,
+        storageScope: dotenvSecret.scope || "dotenv-file"
+      };
+    }
+
     return {
       value: processEnvSecret.value,
       source: "env",
@@ -380,13 +972,31 @@ function getResolvedApiKey() {
     };
   }
 
-  const dotenvSecret = getDotenvApiKey();
   if (dotenvSecret.value) {
     return {
       value: dotenvSecret.value,
       source: "dotenv",
       storageKey: dotenvSecret.storageKey,
       storageScope: dotenvSecret.scope || "dotenv-file"
+    };
+  }
+
+  const persistedValue = normalizePersistedSecretValue(persistedSecrets.apiKey);
+  if (persistedValue) {
+    return {
+      value: persistedValue,
+      source: "database",
+      storageKey: DB_PATH,
+      storageScope: "sqlite-db"
+    };
+  }
+
+  if (runtimeSecrets.apiKey) {
+    return {
+      value: runtimeSecrets.apiKey,
+      source: "session",
+      storageKey: "",
+      storageScope: "memory-only"
     };
   }
 
@@ -405,6 +1015,16 @@ function getResolvedAccessToken() {
       source: "session",
       storageKey: "",
       storageScope: "memory-only"
+    };
+  }
+
+  const persistedValue = normalizePersistedSecretValue(persistedSecrets.accessToken);
+  if (persistedValue) {
+    return {
+      value: persistedValue,
+      source: "database",
+      storageKey: DB_PATH,
+      storageScope: "sqlite-db"
     };
   }
 
@@ -436,12 +1056,16 @@ function getResolvedAccessToken() {
   };
 }
 
-function buildEffectiveApiEndpoint(baseUrl = "") {
+function buildEffectiveApiEndpoint(baseUrl = "", apiProtocol = "chat_completions") {
   const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
   if (!trimmed) {
     return "";
   }
-  return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
+  const root = trimmed.replace(/\/(?:chat\/completions|responses)$/i, "");
+  if (!root) {
+    return "";
+  }
+  return `${root}${normalizeApiProtocol(apiProtocol) === "responses" ? "/responses" : "/chat/completions"}`;
 }
 
 function normalizeBasePath(value = "") {
@@ -511,6 +1135,7 @@ function normalizePersistedSettings(settings = {}) {
 
   next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
   next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
+  next.apiProtocol = normalizeApiProtocol(next.apiProtocol);
   next.apiKey = "";
   next.accessToken = "";
   delete next.hasApiKey;
@@ -519,6 +1144,7 @@ function normalizePersistedSettings(settings = {}) {
   delete next.apiKeyStorageKey;
   delete next.apiKeyPersistence;
   delete next.apiKeyDotenvPath;
+  delete next.stateStorePath;
   delete next.hasAccessToken;
   delete next.maskedAccessToken;
   delete next.accessTokenSource;
@@ -531,58 +1157,82 @@ function normalizePersistedSettings(settings = {}) {
 
 function loadState() {
   try {
-    if (fs.existsSync(DB_PATH)) {
-      const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-      if (data.appSettings) {
-        if (
-          (typeof data.appSettings.apiKey === "string" && data.appSettings.apiKey.trim()) ||
-          (typeof data.appSettings.accessToken === "string" && data.appSettings.accessToken.trim())
-        ) {
-          pendingStateSanitize = true;
-        }
-        appSettings = normalizePersistedSettings(data.appSettings);
+    dirtyTaskIds.clear();
+    dirtyBlockKeys.clear();
+    replacedTaskBlockIds.clear();
+    deletedTaskIds.clear();
+    dirtyExportJobTaskIds.clear();
+    settingsDirty = false;
+    secretsDirty = false;
+    persistedSecrets.apiKey = "";
+    persistedSecrets.accessToken = "";
+    const db = getStateDb();
+    const settingsRow = db.prepare("SELECT value FROM metadata WHERE key = ?").get("app_settings");
+    const persistedApiKeyRow = db.prepare("SELECT value FROM metadata WHERE key = ?").get(PERSISTED_API_KEY_META_KEY);
+    const persistedAccessTokenRow = db.prepare("SELECT value FROM metadata WHERE key = ?").get(PERSISTED_ACCESS_TOKEN_META_KEY);
+    persistedSecrets.apiKey = normalizePersistedSecretValue(persistedApiKeyRow?.value);
+    persistedSecrets.accessToken = normalizePersistedSecretValue(persistedAccessTokenRow?.value);
+    if (!persistedSecrets.accessToken) {
+      const envAccessToken = getProcessEnvAccessToken();
+      const dotenvAccessToken = envAccessToken.value ? { value: "" } : getDotenvAccessToken();
+      const migratedAccessToken = normalizePersistedSecretValue(envAccessToken.value || dotenvAccessToken.value);
+      if (migratedAccessToken) {
+        persistedSecrets.accessToken = migratedAccessToken;
+        secretsDirty = true;
       }
-      if (data.tasks) {
-        for (const t of data.tasks) {
-          if (t?.config) {
-            if (
-              (typeof t.config.apiKey === "string" && t.config.apiKey.trim()) ||
-              (typeof t.config.accessToken === "string" && t.config.accessToken.trim())
-            ) {
-              pendingStateSanitize = true;
-            }
-            t.config = normalizePersistedSettings(t.config);
-          } else {
-            t.config = normalizePersistedSettings();
-          }
-          t.documentFormat = t.documentFormat || "markdown";
-          t.asset = t.asset || null;
-          t.contentVersion = typeof t.contentVersion === "string" && t.contentVersion ? t.contentVersion : (t.updatedAt || t.createdAt || now());
-          if (Array.isArray(t.blocks)) {
-            for (const block of t.blocks) {
-              block.promptSnapshot = null;
-              block.annotations = Array.isArray(block.annotations) ? block.annotations : [];
-              block.comments = Array.isArray(block.comments) ? block.comments : [];
-              block.translationUnit = normalizeEpubTranslationUnit(block.translationUnit);
-              if (activeStatus(block.status)) {
-                block.status = "paused";
-                block.errorMessage = "";
-                block.reviewErrorMessage = "";
-              }
-            }
-          }
-          t.annotations = Array.isArray(t.annotations) ? t.annotations : [];
-          t.comments = Array.isArray(t.comments) ? t.comments : [];
-          t.activity = Array.isArray(t.activity) ? t.activity : [];
-          t.exportJobs = Array.isArray(t.exportJobs) ? t.exportJobs.map((job) => normalizePersistedExportJob(job)) : [];
-          t.runtime = t.runtime && typeof t.runtime === "object" ? t.runtime : { sessionStartedAt: "", pendingQueue: [] };
-          t.runtime.sessionStartedAt = typeof t.runtime.sessionStartedAt === "string" ? t.runtime.sessionStartedAt : "";
-          t.runtime.pendingQueue = [];
-          t.summary = buildSummary(t);
-          t.exports = {};
-          tasks.set(t.id, t);
-        }
+    }
+    if (settingsRow?.value) {
+      const persistedSettings = JSON.parse(settingsRow.value);
+      const legacyApiKey = typeof persistedSettings?.apiKey === "string" ? persistedSettings.apiKey.trim() : "";
+      const legacyAccessToken = typeof persistedSettings?.accessToken === "string" ? persistedSettings.accessToken.trim() : "";
+      if (legacyApiKey || legacyAccessToken) {
+        pendingStateSanitize = true;
       }
+      if (legacyApiKey && !persistedSecrets.apiKey) {
+        persistedSecrets.apiKey = legacyApiKey;
+        secretsDirty = true;
+      }
+      if (legacyAccessToken && !persistedSecrets.accessToken) {
+        persistedSecrets.accessToken = legacyAccessToken;
+        secretsDirty = true;
+      }
+      appSettings = normalizePersistedSettings(persistedSettings);
+    }
+    migrateLegacyApiKeyPersistenceToDotenv();
+
+    const taskRows = db.prepare("SELECT id, payload_json FROM tasks ORDER BY updated_at DESC").all();
+    const blockRows = db.prepare("SELECT task_id, payload_json FROM task_blocks ORDER BY task_id, order_index ASC").all();
+    const exportJobRows = db.prepare(`
+      SELECT task_id, payload_json
+      FROM task_export_jobs
+      ORDER BY task_id, created_at DESC, updated_at DESC
+    `).all();
+    const blocksByTaskId = new Map();
+    for (const row of blockRows) {
+      const existing = blocksByTaskId.get(row.task_id);
+      if (existing) {
+        existing.push(row);
+      } else {
+        blocksByTaskId.set(row.task_id, [row]);
+      }
+    }
+    const exportJobsByTaskId = new Map();
+    for (const row of exportJobRows) {
+      const existing = exportJobsByTaskId.get(row.task_id);
+      if (existing) {
+        existing.push(row);
+      } else {
+        exportJobsByTaskId.set(row.task_id, [row]);
+      }
+    }
+
+    for (const row of taskRows) {
+      const t = hydrateTaskRecord(
+        JSON.parse(row.payload_json),
+        blocksByTaskId.get(row.id) || [],
+        exportJobsByTaskId.get(row.id) || []
+      );
+      tasks.set(t.id, t);
     }
   } catch(e) { console.error("Failed to load state", e); }
 }
@@ -590,30 +1240,171 @@ function loadState() {
 let saveTimeout = null;
 
 function writeStateToDisk() {
-  const data = {
-    appSettings: normalizePersistedSettings(appSettings),
-    tasks: Array.from(tasks.values(), (task) => {
-      const nextTask = structuredClone(task);
-      nextTask.config = normalizePersistedSettings(nextTask.config);
-      nextTask.exports = {};
-      nextTask.exportJobs = ensureTaskExportJobs(nextTask).map((job) => normalizePersistedExportJob(job));
-      if (nextTask.runtime && typeof nextTask.runtime === "object") {
-        nextTask.runtime.pendingQueue = [];
-      }
-      if (Array.isArray(nextTask.blocks)) {
-        for (const block of nextTask.blocks) {
-          block.promptSnapshot = null;
-        }
-      }
-      return nextTask;
-    })
-  };
-
-  if (!fs.existsSync(path.dirname(DB_PATH))) {
-    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  if (!hasPendingPersistence()) {
+    return;
   }
 
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
+  const db = getStateDb();
+  const dirtyTasks = Array.from(dirtyTaskIds, (taskId) => tasks.get(taskId)).filter(Boolean);
+  const persistedTasks = dirtyTasks.map((task) => ({
+    task,
+    payloadJson: JSON.stringify(serializeTaskForPersistence(task)),
+    summaryJson: serializeTaskSummaryForPersistence(task)
+  }));
+  const taskBlockReplacements = Array.from(replacedTaskBlockIds, (taskId) => tasks.get(taskId))
+    .filter(Boolean)
+    .map((task) => ({
+      task,
+      blocks: (task.blocks || []).map((block) => serializeBlockForPersistence(task, block))
+    }));
+  const dirtyBlocks = Array.from(dirtyBlockKeys, (key) => parseDirtyBlockKey(key))
+    .filter(({ taskId, blockId }) => taskId && blockId && !replacedTaskBlockIds.has(taskId))
+    .map(({ taskId, blockId }) => {
+      const task = tasks.get(taskId);
+      const block = task?.blocks?.find((candidate) => candidate.id === blockId) || null;
+      return task && block
+        ? serializeBlockForPersistence(task, block)
+        : null;
+    })
+    .filter(Boolean);
+  const exportJobTasks = Array.from(dirtyExportJobTaskIds, (taskId) => tasks.get(taskId))
+    .filter(Boolean)
+    .map((task) => ({
+      taskId: task.id,
+      jobs: ensureTaskExportJobs(task).map((job) => serializeExportJobForPersistence(task.id, job))
+    }));
+  const deletedTaskIdList = Array.from(deletedTaskIds);
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const upsertMeta = db.prepare(`
+      INSERT INTO metadata(key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    const deleteTask = db.prepare("DELETE FROM tasks WHERE id = ?");
+    const insertTask = db.prepare(`
+      INSERT INTO tasks(id, updated_at, payload_json, summary_json)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        payload_json = excluded.payload_json,
+        summary_json = excluded.summary_json
+    `);
+    const deleteTaskBlocks = db.prepare("DELETE FROM task_blocks WHERE task_id = ?");
+    const deleteTaskFts = db.prepare("DELETE FROM task_blocks_fts WHERE task_id = ?");
+    const insertTaskBlock = db.prepare(`
+      INSERT INTO task_blocks(task_id, block_id, order_index, updated_at, source_text, translated_text, payload_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id, block_id) DO UPDATE SET
+        order_index = excluded.order_index,
+        updated_at = excluded.updated_at,
+        source_text = excluded.source_text,
+        translated_text = excluded.translated_text,
+        payload_json = excluded.payload_json
+    `);
+    const deleteTaskBlock = db.prepare("DELETE FROM task_blocks WHERE task_id = ? AND block_id = ?");
+    const deleteTaskBlockFts = db.prepare("DELETE FROM task_blocks_fts WHERE task_id = ? AND block_id = ?");
+    const insertTaskFts = db.prepare(`
+      INSERT INTO task_blocks_fts(task_id, block_id, source_text, translated_text)
+      VALUES (?, ?, ?, ?)
+    `);
+    const deleteExportJobs = db.prepare("DELETE FROM task_export_jobs WHERE task_id = ?");
+    const insertExportJob = db.prepare(`
+      INSERT INTO task_export_jobs(task_id, job_id, created_at, updated_at, payload_json)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(task_id, job_id) DO UPDATE SET
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at,
+        payload_json = excluded.payload_json
+    `);
+
+    if (settingsDirty) {
+      upsertMeta.run("app_settings", JSON.stringify(normalizePersistedSettings(appSettings)));
+    }
+    const deleteMeta = db.prepare("DELETE FROM metadata WHERE key = ?");
+    if (secretsDirty) {
+      persistMetadataSecret(upsertMeta, deleteMeta, PERSISTED_API_KEY_META_KEY, persistedSecrets.apiKey);
+      persistMetadataSecret(upsertMeta, deleteMeta, PERSISTED_ACCESS_TOKEN_META_KEY, persistedSecrets.accessToken);
+    }
+    for (const taskId of deletedTaskIdList) {
+      deleteTaskBlocks.run(taskId);
+      deleteTaskFts.run(taskId);
+      deleteExportJobs.run(taskId);
+      deleteTask.run(taskId);
+    }
+    for (const persistedTask of persistedTasks) {
+      const updatedAt = persistedTask.task.updatedAt || persistedTask.task.createdAt || now();
+      insertTask.run(persistedTask.task.id, updatedAt, persistedTask.payloadJson, persistedTask.summaryJson);
+    }
+    for (const replacement of taskBlockReplacements) {
+      deleteTaskBlocks.run(replacement.task.id);
+      deleteTaskFts.run(replacement.task.id);
+      for (const blockRecord of replacement.blocks) {
+        insertTaskBlock.run(
+          blockRecord.taskId,
+          blockRecord.blockId,
+          blockRecord.orderIndex,
+          blockRecord.updatedAt,
+          blockRecord.sourceText,
+          blockRecord.translatedText,
+          blockRecord.payloadJson
+        );
+        insertTaskFts.run(
+          blockRecord.taskId,
+          blockRecord.blockId,
+          blockRecord.sourceText,
+          blockRecord.translatedText
+        );
+      }
+    }
+    for (const blockRecord of dirtyBlocks) {
+      deleteTaskBlock.run(blockRecord.taskId, blockRecord.blockId);
+      deleteTaskBlockFts.run(blockRecord.taskId, blockRecord.blockId);
+      insertTaskBlock.run(
+        blockRecord.taskId,
+        blockRecord.blockId,
+        blockRecord.orderIndex,
+        blockRecord.updatedAt,
+        blockRecord.sourceText,
+        blockRecord.translatedText,
+        blockRecord.payloadJson
+      );
+      insertTaskFts.run(
+        blockRecord.taskId,
+        blockRecord.blockId,
+        blockRecord.sourceText,
+        blockRecord.translatedText
+      );
+    }
+    for (const exportJobTask of exportJobTasks) {
+      deleteExportJobs.run(exportJobTask.taskId);
+      for (const jobRecord of exportJobTask.jobs) {
+        insertExportJob.run(
+          jobRecord.taskId,
+          jobRecord.jobId,
+          jobRecord.createdAt,
+          jobRecord.updatedAt,
+          jobRecord.payloadJson
+        );
+      }
+    }
+    db.exec("COMMIT");
+    dirtyTaskIds.clear();
+    dirtyBlockKeys.clear();
+    replacedTaskBlockIds.clear();
+    deletedTaskIds.clear();
+    dirtyExportJobTaskIds.clear();
+    settingsDirty = false;
+    secretsDirty = false;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore rollback errors.
+    }
+    throw error;
+  }
 }
 
 export function flushState() {
@@ -647,7 +1438,13 @@ function saveState() {
 
 getDotenvApiKey();
 loadState();
-if (pendingStateSanitize) {
+if (pendingStateSanitize || secretsDirty) {
+  if (pendingStateSanitize) {
+    settingsDirty = true;
+    for (const taskId of tasks.keys()) {
+      markTaskDirty(taskId);
+    }
+  }
   flushState();
 }
 
@@ -848,6 +1645,8 @@ function updateExportJobProgress(task, job, patch = {}, options = {}) {
 
   refreshTask(task, {
     touchUpdatedAt: false,
+    taskDirty: options.taskDirty === true,
+    exportJobsDirty: true,
     persist: options.persist !== false
   });
 }
@@ -917,6 +1716,105 @@ function rebuildTextOnlyEpubFragment(sourceFragment, translatedText) {
     throw new Error("Failed to rebuild text-only EPUB fragment.");
   }
   return match[1] + escapeXmlText(String(translatedText || "").trim()) + match[3];
+}
+
+function splitEditedLines(value = "") {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function getProtectedEpubSegmentIndexes(block) {
+  const indexes = new Set();
+  if (!shouldUseEpubPlaceholderMode(block)) {
+    return indexes;
+  }
+
+  const plan = getEpubPlaceholderPlan(block);
+  if (!plan?.parts?.length) {
+    return indexes;
+  }
+
+  for (const part of plan.parts) {
+    if (part.type === "keep") {
+      indexes.add(part.index);
+    }
+  }
+  return indexes;
+}
+
+function buildBestEffortEditedEpubSegments(block, translatedText) {
+  const segments = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments : [];
+  if (!segments.length) {
+    return [];
+  }
+
+  const protectedIndexes = getProtectedEpubSegmentIndexes(block);
+  const editableSegments = segments.filter((segment) => !protectedIndexes.has(segment.index));
+  const nextSegments = Array(segments.length).fill("");
+  for (const segment of segments) {
+    if (protectedIndexes.has(segment.index)) {
+      nextSegments[segment.index - 1] = segment.sourceText;
+    }
+  }
+
+  if (!editableSegments.length) {
+    return nextSegments;
+  }
+
+  const normalizedText = String(translatedText || "").trim();
+  const lineAwareSplit = block.type === "blockquote" || /<br\b/i.test(String(block.translationUnit?.segmentTemplate || ""));
+  if (lineAwareSplit) {
+    const lines = splitEditedLines(normalizedText);
+    if (lines.length > 1) {
+      editableSegments.forEach((segment, index) => {
+        if (index < lines.length - 1) {
+          nextSegments[segment.index - 1] = lines[index];
+          return;
+        }
+        if (index === editableSegments.length - 1) {
+          nextSegments[segment.index - 1] = lines.slice(index).join(" ").trim();
+          return;
+        }
+        nextSegments[segment.index - 1] = lines[index] || "";
+      });
+      return nextSegments;
+    }
+  }
+
+  nextSegments[editableSegments[0].index - 1] = normalizedText;
+  return nextSegments;
+}
+
+function applyManualTextEditToEpubBlock(block, translatedText) {
+  const sourceFragment = block.translationUnit?.sourceFragment || block.sourceMarkdown;
+  const segmentCount = Array.isArray(block.translationUnit?.segments) ? block.translationUnit.segments.length : 0;
+
+  if (block.translationUnit?.segmentTemplate && segmentCount > 0) {
+    const translatedSegments = buildBestEffortEditedEpubSegments(block, translatedText);
+    const applied = applyEpubTranslationUnit({
+      blockType: block.type,
+      sourceMarkdown: block.sourceMarkdown,
+      translationUnit: block.translationUnit,
+      translatedSegments
+    });
+    return {
+      ...applied,
+      structureSignature: "manual-text-edit"
+    };
+  }
+
+  if (block.translationUnit?.textOnly) {
+    return {
+      normalizedFragment: rebuildTextOnlyEpubFragment(sourceFragment, translatedText),
+      previewText: String(translatedText || "").trim(),
+      structureSignature: "manual-text-edit"
+    };
+  }
+
+  throw createError(409, "manual_edit_not_supported", "This EPUB block cannot be edited as plain text.");
 }
 
 function unwrapEpubSegmentPayload(payload) {
@@ -1104,7 +2002,7 @@ async function repairMalformedEpubSegmentTranslation(task, block, rawTranslation
     }
   };
 
-  const repairResult = await translateWithDeepSeek({
+  const repairResult = await translateWithProvider({
     provider: providerSettings,
     promptSnapshot: repairPromptSnapshot,
     signal
@@ -1156,7 +2054,7 @@ async function repairMalformedEpubPlaceholderTranslation(task, block, rawTransla
     }
   };
 
-  const repairResult = await translateWithDeepSeek({
+  const repairResult = await translateWithProvider({
     provider: providerSettings,
     promptSnapshot: repairPromptSnapshot,
     signal
@@ -1452,40 +2350,46 @@ function sanitizeConfig(config) {
   const next = clone(stripSecretFields(config));
   const resolvedApiKey = getResolvedApiKey();
   const resolvedAccessToken = getResolvedAccessToken();
+  next.stateStorePath = DB_PATH;
   next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
   next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
+  next.apiProtocol = normalizeApiProtocol(next.apiProtocol);
 
   next.apiKey = "";
   next.hasApiKey = Boolean(resolvedApiKey.value);
   next.maskedApiKey = maskSecret(resolvedApiKey.value);
   next.apiKeySource = resolvedApiKey.source;
-  next.apiKeyStorageKey = resolvedApiKey.source === "dotenv" ? resolvedApiKey.storageKey : "";
+  next.apiKeyStorageKey = ["dotenv", "env"].includes(resolvedApiKey.source) ? resolvedApiKey.storageKey : "";
   next.apiKeyPersistence =
-    resolvedApiKey.source === "dotenv"
-      ? "dotenv-file"
-      : resolvedApiKey.source === "session"
-        ? "memory-only"
-        : resolvedApiKey.source === "env"
-          ? "environment"
-          : "none";
+    resolvedApiKey.source === "database"
+      ? "sqlite-db"
+      : resolvedApiKey.source === "dotenv"
+        ? "dotenv-file"
+        : resolvedApiKey.source === "session"
+          ? "memory-only"
+          : resolvedApiKey.source === "env"
+            ? "environment"
+            : "none";
   next.apiKeyDotenvPath = DOTENV_PATH;
   next.hasAccessToken = Boolean(resolvedAccessToken.value);
   next.maskedAccessToken = maskSecret(resolvedAccessToken.value);
   next.accessTokenSource = resolvedAccessToken.source;
   next.accessTokenStorageKey = ["dotenv", "env"].includes(resolvedAccessToken.source) ? resolvedAccessToken.storageKey : "";
   next.accessTokenPersistence =
-    resolvedAccessToken.source === "dotenv"
-      ? "dotenv-file"
-      : resolvedAccessToken.source === "session"
-        ? "memory-only"
-        : resolvedAccessToken.source === "env"
-          ? "environment"
-          : "none";
+    resolvedAccessToken.source === "database"
+      ? "sqlite-db"
+      : resolvedAccessToken.source === "dotenv"
+        ? "dotenv-file"
+        : resolvedAccessToken.source === "session"
+          ? "memory-only"
+          : resolvedAccessToken.source === "env"
+            ? "environment"
+            : "none";
   next.accessTokenDotenvPath = DOTENV_PATH;
   next.authRequired = Boolean(resolvedAccessToken.value);
-  next.apiKeyMutationGuard = "loopback-only";
+  next.apiKeyMutationGuard = "settings-save-dotenv";
   next.accessTokenMutationGuard = "loopback-only";
-  next.effectiveApiEndpoint = buildEffectiveApiEndpoint(next.apiBaseUrl);
+  next.effectiveApiEndpoint = buildEffectiveApiEndpoint(next.apiBaseUrl, next.apiProtocol);
   next.publicApiBaseUrl = buildPublicApiBaseUrl(next.publicBaseUrl);
   next.publicBasePath = extractPublicBasePath(next.publicBaseUrl);
 
@@ -1515,30 +2419,36 @@ function buildTaskConfig(config = {}) {
   merged.hasApiKey = Boolean(resolvedApiKey.value);
   merged.maskedApiKey = maskSecret(resolvedApiKey.value);
   merged.apiKeySource = resolvedApiKey.source;
-  merged.apiKeyStorageKey = resolvedApiKey.source === "dotenv" ? resolvedApiKey.storageKey : "";
+  merged.apiKeyStorageKey = ["dotenv", "env"].includes(resolvedApiKey.source) ? resolvedApiKey.storageKey : "";
   merged.apiKeyPersistence =
-    resolvedApiKey.source === "dotenv"
-      ? "dotenv-file"
-      : resolvedApiKey.source === "session"
-        ? "memory-only"
-        : resolvedApiKey.source === "env"
-          ? "environment"
-          : "none";
+    resolvedApiKey.source === "database"
+      ? "sqlite-db"
+      : resolvedApiKey.source === "dotenv"
+        ? "dotenv-file"
+        : resolvedApiKey.source === "session"
+          ? "memory-only"
+          : resolvedApiKey.source === "env"
+            ? "environment"
+            : "none";
   merged.hasAccessToken = Boolean(resolvedAccessToken.value);
   merged.maskedAccessToken = maskSecret(resolvedAccessToken.value);
   merged.accessTokenSource = resolvedAccessToken.source;
   merged.accessTokenStorageKey = ["dotenv", "env"].includes(resolvedAccessToken.source) ? resolvedAccessToken.storageKey : "";
   merged.accessTokenPersistence =
-    resolvedAccessToken.source === "dotenv"
-      ? "dotenv-file"
-      : resolvedAccessToken.source === "session"
-        ? "memory-only"
-        : resolvedAccessToken.source === "env"
-          ? "environment"
-          : "none";
+    resolvedAccessToken.source === "database"
+      ? "sqlite-db"
+      : resolvedAccessToken.source === "dotenv"
+        ? "dotenv-file"
+        : resolvedAccessToken.source === "session"
+          ? "memory-only"
+          : resolvedAccessToken.source === "env"
+            ? "environment"
+            : "none";
   merged.apiKeyDotenvPath = DOTENV_PATH;
   merged.accessTokenDotenvPath = DOTENV_PATH;
+  merged.stateStorePath = DB_PATH;
   merged.authRequired = Boolean(resolvedAccessToken.value);
+  merged.apiProtocol = normalizeApiProtocol(merged.apiProtocol);
 
   return merged;
 }
@@ -1550,6 +2460,7 @@ function getProviderSettings(task) {
     apiProvider: task.config.apiProvider,
     apiKey: resolvedApiKey.value,
     apiBaseUrl: task.config.apiBaseUrl,
+    apiProtocol: normalizeApiProtocol(task.config.apiProtocol || appSettings.apiProtocol),
     model: task.config.model,
     requestTimeoutMs: task.config.requestTimeoutMs
   };
@@ -1560,6 +2471,7 @@ function mergeSettings(currentSettings, patch = {}) {
   const stringFields = [
     "apiProvider",
     "apiBaseUrl",
+    "apiProtocol",
     "publicBaseUrl",
     "model",
     "sourceLanguage",
@@ -1586,14 +2498,16 @@ function mergeSettings(currentSettings, patch = {}) {
     if (typeof patch.apiKey !== "string") {
       throw createError(400, "invalid_request", "apiKey must be a string.");
     }
-    runtimeSecrets.apiKey = patch.apiKey.trim();
+    persistApiKeyToPermanentEnv(patch.apiKey);
   }
 
   if (patch.accessToken !== undefined) {
     if (typeof patch.accessToken !== "string") {
       throw createError(400, "invalid_request", "accessToken must be a string.");
     }
-    runtimeSecrets.accessToken = patch.accessToken.trim();
+    const nextAccessToken = patch.accessToken.trim();
+    runtimeSecrets.accessToken = "";
+    setPersistedSecret("accessToken", nextAccessToken);
   }
 
   const booleanFields = ["trustProxyHeaders"];
@@ -1628,6 +2542,7 @@ function mergeSettings(currentSettings, patch = {}) {
   delete next.accessTokenPersistence;
   next.publicBaseUrl = normalizePublicBaseUrl(next.publicBaseUrl);
   next.trustProxyHeaders = Boolean(next.trustProxyHeaders);
+  next.apiProtocol = normalizeApiProtocol(next.apiProtocol);
   return next;
 }
 
@@ -1900,6 +2815,25 @@ function refreshTask(task, options = {}) {
     rebuildPromptSnapshots: options.rebuildPromptSnapshots === true,
     rebuildExports: options.rebuildExports === true
   });
+
+  if (options.taskDirty !== false) {
+    markTaskDirty(task.id);
+  }
+
+  if (options.replaceBlocks) {
+    markTaskBlocksReplaced(task.id);
+  } else if (Array.isArray(options.dirtyBlocks)) {
+    for (const block of options.dirtyBlocks) {
+      if (block?.id) {
+        markTaskBlockDirty(task.id, block.id);
+      }
+    }
+  }
+
+  if (options.exportJobsDirty === true) {
+    markTaskExportJobsDirty(task.id);
+  }
+
   if (options.persist !== false) {
     saveState();
   }
@@ -1927,6 +2861,79 @@ function summarizeTask(task) {
     summary: task.summary,
     exportJobs: ensureTaskExportJobs(task).map((job) => sanitizeExportJob(task, job))
   };
+}
+
+function parsePersistedTaskPayload(row) {
+  return JSON.parse(row?.payload_json || "{}");
+}
+
+function parsePersistedTaskSummary(taskId, summaryJson) {
+  const parsed = parsePersistedSummary(summaryJson);
+  if (parsed) {
+    return parsed;
+  }
+  const task = tasks.get(taskId);
+  return task ? clone(task.summary) : null;
+}
+
+function groupRowsByTaskId(rows = []) {
+  const buckets = new Map();
+  for (const row of rows) {
+    const taskId = row?.task_id;
+    if (!taskId) {
+      continue;
+    }
+    const existing = buckets.get(taskId);
+    if (existing) {
+      existing.push(row);
+    } else {
+      buckets.set(taskId, [row]);
+    }
+  }
+  return buckets;
+}
+
+function loadPersistedExportJobsForTaskIds(db, taskIds = []) {
+  if (!Array.isArray(taskIds) || !taskIds.length) {
+    return new Map();
+  }
+
+  const placeholders = taskIds.map(() => "?").join(", ");
+  const rows = db.prepare(`
+    SELECT task_id, payload_json
+    FROM task_export_jobs
+    WHERE task_id IN (${placeholders})
+    ORDER BY task_id, created_at DESC, updated_at DESC
+  `).all(...taskIds);
+
+  const groupedRows = groupRowsByTaskId(rows);
+  const normalized = new Map();
+  for (const [taskId, taskRows] of groupedRows.entries()) {
+    normalized.set(
+      taskId,
+      taskRows.map((row) => normalizePersistedExportJob(JSON.parse(row.payload_json)))
+    );
+  }
+  return normalized;
+}
+
+function loadPersistedExportJobsForTask(db, taskId) {
+  return loadPersistedExportJobsForTaskIds(db, [taskId]).get(taskId) || [];
+}
+
+function sanitizePersistedExportJobs(taskPayload, exportJobs = []) {
+  const taskLike = {
+    id: taskPayload.id,
+    contentVersion: taskPayload.contentVersion || "",
+    exportJobs
+  };
+  return exportJobs.map((job) => sanitizeExportJob(taskLike, job));
+}
+
+function ensurePersistedStateFresh(taskId = "") {
+  if (hasPendingPersistence(taskId)) {
+    flushState();
+  }
 }
 
 function ensureTask(taskId) {
@@ -2217,7 +3224,10 @@ function scheduleBlockTranslation(task, block, options = {}) {
   block.reviewCandidateTranslation = "";
   block.reviewErrorMessage = "";
   markSessionStart(task);
-  refreshTask(task, { persist: false });
+  refreshTask(task, {
+    persist: false,
+    dirtyBlocks: [block]
+  });
 
   void (async () => {
     let candidateTranslation = "";
@@ -2232,7 +3242,7 @@ function scheduleBlockTranslation(task, block, options = {}) {
       const providerLabel = providerSettings.apiProvider || "Provider";
       const providerController = new AbortController();
       rememberBlockAbortController(task.id, block.id, providerController);
-      const providerResult = await translateWithDeepSeek({
+      const providerResult = await translateWithProvider({
         provider: providerSettings,
         promptSnapshot,
         useRetranslationPrompt: Boolean(options.retranslationGoal),
@@ -2339,7 +3349,9 @@ function scheduleBlockTranslation(task, block, options = {}) {
         block.reviewCandidateTranslation = "";
       }
     } finally {
-      refreshTask(task);
+      refreshTask(task, {
+        dirtyBlocks: [block]
+      });
       clearBlockTimers(task.id, block.id);
       clearBlockAbortControllers(task.id, block.id);
       pumpTaskQueue(task);
@@ -2387,9 +3399,10 @@ async function createTaskRecord({ filename, content, contentBase64, contentBuffe
   };
 
   addActivity(task, "task_created", "Task created", `${filename} was parsed into block mappings.`);
-  refreshTask(task);
   tasks.set(task.id, task);
-  saveState();
+  refreshTask(task, {
+    replaceBlocks: true
+  });
   return task;
 }
 
@@ -2467,7 +3480,10 @@ async function reparseIntoTask(task, payload = {}) {
   markTaskContentChanged(task);
 
   addActivity(task, "task_reparsed", "Task reparsed", `${task.filename} was reparsed and block mappings were rebuilt.`);
-  refreshTask(task);
+  refreshTask(task, {
+    replaceBlocks: true,
+    exportJobsDirty: true
+  });
 }
 
 
@@ -2508,9 +3524,33 @@ export function getServiceOverview(context = {}) {
 }
 
 export function listTasks() {
-  return [...tasks.values()]
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-    .map((task) => summarizeTask(task));
+  ensurePersistedStateFresh();
+  const db = getStateDb();
+  const taskRows = db.prepare(`
+    SELECT id, updated_at, payload_json, summary_json
+    FROM tasks
+    ORDER BY updated_at DESC
+  `).all();
+  const exportJobsByTaskId = loadPersistedExportJobsForTaskIds(db, taskRows.map((row) => row.id));
+
+  return taskRows.map((row) => {
+    const taskPayload = parsePersistedTaskPayload(row);
+    const summary = parsePersistedTaskSummary(row.id, row.summary_json) || {};
+    const exportJobs = exportJobsByTaskId.get(row.id) || [];
+    return {
+      id: row.id,
+      filename: taskPayload.filename,
+      source: taskPayload.source,
+      documentFormat: taskPayload.documentFormat || "markdown",
+      createdAt: taskPayload.createdAt,
+      updatedAt: taskPayload.updatedAt || row.updated_at,
+      stage: summary.stage || "parsed",
+      parser: taskPayload.parser,
+      stats: taskPayload.stats,
+      summary,
+      exportJobs: sanitizePersistedExportJobs(taskPayload, exportJobs)
+    };
+  });
 }
 
 export function getSettings() {
@@ -2523,16 +3563,17 @@ export async function testProviderConnection() {
     apiProvider: settings.apiProvider,
     apiKey: getResolvedApiKey().value,
     apiBaseUrl: settings.apiBaseUrl,
+    apiProtocol: settings.apiProtocol,
     model: settings.model,
     requestTimeoutMs: appSettings.requestTimeoutMs
   };
 
   return {
     testedAt: now(),
-    effectiveApiEndpoint: buildEffectiveApiEndpoint(settings.apiBaseUrl),
+    effectiveApiEndpoint: buildEffectiveApiEndpoint(settings.apiBaseUrl, settings.apiProtocol),
     keySource: settings.apiKeySource,
     keyStorageKey: settings.apiKeyStorageKey,
-    result: await testChatCompletionsConnection({ provider })
+    result: await runProviderConnectionTest({ provider })
   };
 }
 
@@ -2542,6 +3583,7 @@ export function updateSettings(patch = {}) {
   }
 
   appSettings = mergeSettings(appSettings, patch);
+  settingsDirty = true;
   flushState();
   return getSettings();
 }
@@ -2558,6 +3600,8 @@ export function persistAccessTokenToDotenv(payload = {}) {
   const accessToken = requireNonEmptyString(payload.accessToken, "accessToken");
   writeManagedAccessTokenToDotenv(accessToken);
   runtimeSecrets.accessToken = "";
+  setPersistedSecret("accessToken", accessToken);
+  flushState();
 
   const persistedValue = getDotenvAccessToken().value;
   if (persistedValue !== accessToken) {
@@ -2573,13 +3617,8 @@ export function persistApiKeyToDotenv(payload = {}) {
   }
 
   const apiKey = requireNonEmptyString(payload.apiKey, "apiKey");
-  writeManagedApiKeyToDotenv(apiKey);
-  runtimeSecrets.apiKey = "";
-
-  const persistedValue = getDotenvApiKey().value;
-  if (persistedValue !== apiKey) {
-    throw createError(500, "dotenv_persist_failed", "Failed to persist API key to the local .env file.");
-  }
+  persistApiKeyToPermanentEnv(apiKey);
+  flushState();
 
   return getSettings();
 }
@@ -2587,40 +3626,51 @@ export function persistApiKeyToDotenv(payload = {}) {
 export function clearApiKey(payload = {}) {
   const options = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
   const rawScope = options.scope === undefined ? "all" : requireNonEmptyString(options.scope, "scope").toLowerCase();
-  const scope = rawScope === "env" ? "dotenv" : rawScope;
+  const scope = rawScope === "env" ? "dotenv" : rawScope === "db" ? "database" : rawScope;
 
-  if (!["session", "dotenv", "all"].includes(scope)) {
-    throw createError(400, "invalid_request", 'scope must be one of session, dotenv, all.');
+  if (!["session", "database", "dotenv", "all"].includes(scope)) {
+    throw createError(400, "invalid_request", 'scope must be one of session, database, dotenv, all.');
   }
 
   if (scope === "session" || scope === "all") {
     runtimeSecrets.apiKey = "";
   }
 
-  if (scope === "dotenv" || scope === "all") {
-    clearManagedApiKeyFromDotenv();
+  if (scope === "database" || scope === "all") {
+    setPersistedSecret("apiKey", "");
   }
 
+  if (scope === "dotenv" || scope === "all") {
+    clearManagedApiKeyFromDotenv();
+    activateManagedApiKeyForCurrentProcess("");
+  }
+
+  flushState();
   return getSettings();
 }
 
 export function clearAccessToken(payload = {}) {
   const options = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
   const rawScope = options.scope === undefined ? "all" : requireNonEmptyString(options.scope, "scope").toLowerCase();
-  const scope = rawScope === "env" ? "dotenv" : rawScope;
+  const scope = rawScope === "env" ? "dotenv" : rawScope === "db" ? "database" : rawScope;
 
-  if (!["session", "dotenv", "all"].includes(scope)) {
-    throw createError(400, "invalid_request", 'scope must be one of session, dotenv, all.');
+  if (!["session", "database", "dotenv", "all"].includes(scope)) {
+    throw createError(400, "invalid_request", 'scope must be one of session, database, dotenv, all.');
   }
 
   if (scope === "session" || scope === "all") {
     runtimeSecrets.accessToken = "";
   }
 
+  if (scope === "database" || scope === "all") {
+    setPersistedSecret("accessToken", "");
+  }
+
   if (scope === "dotenv" || scope === "all") {
     clearManagedAccessTokenFromDotenv();
   }
 
+  flushState();
   return getSettings();
 }
 
@@ -2733,15 +3783,50 @@ function serializeTaskPageBlock(block) {
   };
 }
 
-export function getTaskStatus(taskId, options = {}) {
-  const task = ensureTask(taskId);
-  syncTaskReadModel(task, {
-    touchUpdatedAt: false,
-    rebuildPromptSnapshots: false,
-    rebuildExports: false
-  });
+function serializeIndexedBlockRef(block, index, pageSize) {
+  return {
+    id: block.id,
+    order: block.order,
+    page: Math.floor(index / pageSize) + 1
+  };
+}
 
-  const totalBlocks = task.blocks.length;
+function buildFtsMatchExpression(query = "") {
+  const tokens = String(query || "")
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  if (!tokens.length) {
+    return "";
+  }
+  return tokens
+    .map((token) => `"${token.replace(/"/g, '""')}"*`)
+    .join(" AND ");
+}
+
+function escapeLikePattern(query = "") {
+  return String(query || "").replace(/[\\%_]/g, "\\$&");
+}
+
+export function getTaskStatus(taskId, options = {}) {
+  ensureTask(taskId);
+  ensurePersistedStateFresh(taskId);
+  const db = getStateDb();
+  const taskRow = db.prepare(`
+    SELECT id, updated_at, payload_json, summary_json
+    FROM tasks
+    WHERE id = ?
+  `).get(taskId);
+  if (!taskRow) {
+    throw createError(404, "task_not_found", `Task ${taskId} was not found.`);
+  }
+
+  const taskPayload = parsePersistedTaskPayload(taskRow);
+  const summary = parsePersistedTaskSummary(taskId, taskRow.summary_json) || {};
+  const totalBlocks = Number.isInteger(summary.totalBlocks)
+    ? summary.totalBlocks
+    : Number(db.prepare("SELECT COUNT(*) AS count FROM task_blocks WHERE task_id = ?").get(taskId)?.count || 0);
   const requestedPageSize = options.pageSize === "all"
     ? "all"
     : Number(options.pageSize === undefined ? 20 : options.pageSize);
@@ -2757,32 +3842,134 @@ export function getTaskStatus(taskId, options = {}) {
   }
   const page = Math.min(requestedPage, totalPages);
   const pageStart = requestedPageSize === "all" ? 0 : (page - 1) * normalizedPageSize;
-  const pageEnd = requestedPageSize === "all" ? totalBlocks : Math.min(totalBlocks, pageStart + normalizedPageSize);
-  const pageBlocks = task.blocks.slice(pageStart, pageEnd);
+  const pageLimit = requestedPageSize === "all" ? Math.max(1, totalBlocks || 1) : normalizedPageSize;
   const includeBlocks = options.includeBlocks === true;
-  const failedBlocks = task.blocks
-    .filter((block) => block.status === "failed")
-    .map((block) => ({
-      id: block.id,
-      order: block.order
-    }));
+  const pageBlocks = db.prepare(`
+    SELECT payload_json
+    FROM task_blocks
+    WHERE task_id = ?
+    ORDER BY order_index ASC
+    LIMIT ? OFFSET ?
+  `).all(taskId, pageLimit, pageStart).map((row) => serializeTaskPageBlock(JSON.parse(row.payload_json)));
+  const failedBlocks = db.prepare(`
+    SELECT block_id, order_index
+    FROM task_blocks
+    WHERE task_id = ?
+      AND COALESCE(json_extract(payload_json, '$.status'), 'idle') = 'failed'
+    ORDER BY order_index ASC
+  `).all(taskId).map((row) => ({
+    id: row.block_id,
+    order: row.order_index,
+    page: Math.floor(row.order_index / normalizedPageSize) + 1
+  }));
+  const attentionBlocks = db.prepare(`
+    SELECT block_id, order_index
+    FROM task_blocks
+    WHERE task_id = ?
+      AND (
+        COALESCE(json_extract(payload_json, '$.status'), 'idle') = 'failed'
+        OR COALESCE(json_extract(payload_json, '$.reviewState'), 'none') = 'pending_confirmation'
+      )
+    ORDER BY order_index ASC
+  `).all(taskId).map((row) => ({
+    id: row.block_id,
+    order: row.order_index,
+    page: Math.floor(row.order_index / normalizedPageSize) + 1
+  }));
+  const allBlocks = includeBlocks
+    ? db.prepare(`
+      SELECT payload_json
+      FROM task_blocks
+      WHERE task_id = ?
+      ORDER BY order_index ASC
+    `).all(taskId).map((row) => serializeTaskStatusBlock(JSON.parse(row.payload_json)))
+    : undefined;
+  const exportJobs = loadPersistedExportJobsForTask(db, taskId);
 
   return {
-    taskId: task.id,
-    filename: task.filename,
-    documentFormat: task.documentFormat || "markdown",
-    updatedAt: task.updatedAt,
-    stage: task.summary.stage,
-    providerLabel: task.config.apiProvider || appSettings.apiProvider || "Provider",
-    summary: clone(task.summary),
+    taskId,
+    filename: taskPayload.filename,
+    documentFormat: taskPayload.documentFormat || "markdown",
+    updatedAt: taskPayload.updatedAt || taskRow.updated_at,
+    stage: summary.stage || "parsed",
+    providerLabel: taskPayload.config?.apiProvider || appSettings.apiProvider || "Provider",
+    summary,
     page,
     pageSize: normalizedPageSize,
     totalPages,
     totalBlocks,
     failedBlocks,
-    exportJobs: ensureTaskExportJobs(task).map((job) => sanitizeExportJob(task, job)),
-    blocks: includeBlocks ? task.blocks.map(serializeTaskStatusBlock) : undefined,
-    pageBlocks: pageBlocks.map(serializeTaskPageBlock)
+    attentionBlocks,
+    exportJobs: sanitizePersistedExportJobs(taskPayload, exportJobs),
+    blocks: allBlocks,
+    pageBlocks
+  };
+}
+
+export function searchTaskBlocks(taskId, options = {}) {
+  const task = ensureTask(taskId);
+  const query = requireNonEmptyString(options.query, "query").trim();
+  const pageSize = Number.isInteger(options.pageSize) && options.pageSize > 0 ? options.pageSize : 20;
+  const limit = Number.isInteger(options.limit) && options.limit > 0 ? Math.min(options.limit, 200) : 50;
+  ensurePersistedStateFresh(task.id);
+
+  const db = getStateDb();
+  const matches = [];
+  const ftsExpression = buildFtsMatchExpression(query);
+  const selectShape = `
+    SELECT
+      tb.block_id AS id,
+      tb.order_index AS order_index,
+      COALESCE(json_extract(tb.payload_json, '$.status'), 'idle') AS status,
+      COALESCE(json_extract(tb.payload_json, '$.reviewState'), 'none') AS review_state,
+      tb.source_text AS source_text,
+      tb.translated_text AS translated_text
+    FROM task_blocks tb
+  `;
+
+  if (ftsExpression) {
+    const ftsRows = db.prepare(`
+      ${selectShape}
+      JOIN task_blocks_fts
+        ON task_blocks_fts.task_id = tb.task_id
+       AND task_blocks_fts.block_id = tb.block_id
+      WHERE tb.task_id = ?
+        AND task_blocks_fts MATCH ?
+      ORDER BY bm25(task_blocks_fts), tb.order_index ASC
+      LIMIT ?
+    `).all(task.id, ftsExpression, limit);
+    matches.push(...ftsRows);
+  }
+
+  if (!matches.length) {
+    const likePattern = `%${escapeLikePattern(query)}%`;
+    const likeRows = db.prepare(`
+      ${selectShape}
+      WHERE tb.task_id = ?
+        AND (
+          tb.source_text LIKE ? ESCAPE '\\'
+          OR tb.translated_text LIKE ? ESCAPE '\\'
+        )
+      ORDER BY tb.order_index ASC
+      LIMIT ?
+    `).all(task.id, likePattern, likePattern, limit);
+    matches.push(...likeRows);
+  }
+
+  return {
+    taskId: task.id,
+    query: options.query,
+    limit,
+    totalMatches: matches.length,
+    matches: matches.map((row) => ({
+      id: row.id,
+      order: row.order_index,
+      page: Math.floor(row.order_index / pageSize) + 1,
+      status: row.status,
+      reviewState: row.review_state || "none",
+      sourceExcerpt: String(row.source_text || "").slice(0, 220),
+      translatedExcerpt: String(row.translated_text || "").slice(0, 220)
+    }))
   };
 }
 
@@ -2819,7 +4006,9 @@ export function startTaskTranslation(taskId) {
 
   enqueueBlocks(task, eligibleBlocks);
   addActivity(task, "task_translation_started", "Task translation started", `${eligibleBlocks.length} blocks were queued with concurrency ${getTaskConcurrency(task)}.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: eligibleBlocks
+  });
   return sanitizeTask(task);
 }
 
@@ -2830,16 +4019,20 @@ export function pauseTask(taskId) {
   clearTaskAbortControllers(taskId);
 
   let pausedCount = 0;
+  const pausedBlocks = [];
   for (const block of task.blocks) {
     if (activeStatus(block.status)) {
       block.status = "paused";
       block.errorMessage = "";
       pausedCount += 1;
+      pausedBlocks.push(block);
     }
   }
 
   addActivity(task, "task_paused", "Task paused", `${pausedCount} queued or active blocks were paused.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: pausedBlocks
+  });
   return sanitizeTask(task);
 }
 
@@ -2859,7 +4052,9 @@ export function resumeTask(taskId) {
 
   enqueueBlocks(task, pausedBlocks);
   addActivity(task, "task_resumed", "Task resumed", `${pausedBlocks.length} paused blocks were re-queued with concurrency ${getTaskConcurrency(task)}.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: pausedBlocks
+  });
   return sanitizeTask(task);
 }
 
@@ -2870,16 +4065,20 @@ export function cancelTask(taskId) {
   clearTaskAbortControllers(taskId);
 
   let cancelledCount = 0;
+  const cancelledBlocks = [];
   for (const block of task.blocks) {
     if (activeStatus(block.status) || block.status === "paused") {
       block.status = "cancelled";
       block.errorMessage = "";
       cancelledCount += 1;
+      cancelledBlocks.push(block);
     }
   }
 
   addActivity(task, "task_cancelled", "Task cancelled", `${cancelledCount} queued, active or paused blocks were cancelled.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: cancelledBlocks
+  });
   return sanitizeTask(task);
 }
 
@@ -2888,6 +4087,7 @@ export async function deleteTask(taskId) {
   clearTaskTimers(taskId);
   clearTaskAbortControllers(taskId);
   tasks.delete(taskId);
+  markTaskDeleted(taskId);
   await removeTaskArtifacts(task);
   await removeTaskExportCache(taskId);
   saveState();
@@ -2905,7 +4105,9 @@ export function startBlockTranslation(taskId, blockId) {
   const block = ensureTranslatableBlock(task, blockId);
   enqueueBlocks(task, [block]);
   addActivity(task, "block_translation_started", "Block translation started", `${block.id} was queued for translation.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: [block]
+  });
   return sanitizeTask(task);
 }
 
@@ -2926,7 +4128,9 @@ export function retranslateBlock(taskId, blockId, payload = {}) {
   });
 
   addActivity(task, "block_retranslation_started", "Block retranslation started", `${block.id} was queued for retranslation with goal ${retranslationGoal}.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: [block]
+  });
   return sanitizeTask(task);
 }
 
@@ -2973,7 +4177,9 @@ export function retranslateBlocksBatch(taskId, payload = {}) {
     `${scheduledBlockIds.length} blocks were queued for retranslation with concurrency ${getTaskConcurrency(task)}.`
   );
 
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: scheduledBlocks
+  });
 
   return {
     taskId: task.id,
@@ -3026,10 +4232,6 @@ export async function updateBlock(taskId, blockId, patch = {}) {
 
   let changed = false;
 
-  if (patch.translatedMarkdown !== undefined && task.documentFormat === "epub") {
-    throw createError(409, "manual_edit_not_supported", "Manual block text editing is not supported for EPUB tasks. Use retranslation instead.");
-  }
-
   if (patch.reviewState !== undefined) {
     if (!["confirmed", "ignored", "none"].includes(patch.reviewState)) {
       throw createError(400, "invalid_request", "reviewState must be one of confirmed, ignored, none.");
@@ -3059,10 +4261,20 @@ export async function updateBlock(taskId, blockId, patch = {}) {
     if (typeof patch.translatedMarkdown !== "string") {
       throw createError(400, "invalid_request", "translatedMarkdown must be a string.");
     }
-    block.translatedMarkdown = patch.translatedMarkdown;
+    if (task.documentFormat === "epub") {
+      const applied = applyManualTextEditToEpubBlock(block, patch.translatedMarkdown);
+      if (block.translationUnit) {
+        block.translationUnit.translatedFragment = applied.normalizedFragment;
+        block.translationUnit.structureSignature = applied.structureSignature;
+      }
+      block.translatedMarkdown = applied.previewText;
+    } else {
+      block.translatedMarkdown = patch.translatedMarkdown;
+    }
     block.status = "edited";
     block.errorMessage = "";
     block.reviewErrorMessage = "";
+    block.reviewCandidateTranslation = "";
     block.reviewState = "confirmed";
     block.lastEditedAt = now();
     markTaskContentChanged(task);
@@ -3085,7 +4297,9 @@ export async function updateBlock(taskId, blockId, patch = {}) {
   }
 
   addActivity(task, "block_updated", "Block updated", `${block.id} content or lock state was updated.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: [block]
+  });
   return sanitizeTask(task);
 }
 
@@ -3114,7 +4328,9 @@ export function addAnnotation(taskId, blockId, annotationInput) {
   }
 
   addActivity(task, "annotation_saved", "Annotation saved", `${block.id} received a new ${annotation.type} annotation.`);
-  refreshTask(task);
+  refreshTask(task, {
+    dirtyBlocks: [block]
+  });
   return sanitizeTask(task);
 }
 
@@ -3209,10 +4425,9 @@ async function buildArtifactForJob(taskSnapshot, format, normalizedOptions, inte
   }
 
   if (format === "epub" || format === "epub_bilingual") {
-    if (taskSnapshot.documentFormat !== "epub") {
-      throw createError(409, "export_not_supported", "EPUB export is only available for EPUB tasks.");
-    }
-    return buildEpubExport(taskSnapshot, normalizedOptions);
+    return taskSnapshot.documentFormat === "epub"
+      ? buildEpubExport(taskSnapshot, normalizedOptions)
+      : buildMarkdownEpubExport(taskSnapshot, normalizedOptions);
   }
 
   return clone(buildExports(taskSnapshot)[format]);
@@ -3260,7 +4475,9 @@ async function runExportJob(taskId, jobId) {
         task,
         job,
         84,
-        job.format === "epub_bilingual" ? "Packaging bilingual EPUB export." : "Packaging EPUB export."
+        task.documentFormat === "epub"
+          ? (job.format === "epub_bilingual" ? "Packaging bilingual EPUB export." : "Packaging EPUB export.")
+          : (job.format === "epub_bilingual" ? "Generating bilingual EPUB export via Pandoc." : "Generating EPUB export via Pandoc.")
       );
     }
 
@@ -3293,7 +4510,10 @@ async function runExportJob(taskId, jobId) {
     });
 
     addActivity(task, "task_exported", "Task exported", `${task.filename} finished async export as ${formatOptionLabel(job.format, job.options)}.`);
-    refreshTask(task, { touchUpdatedAt: false });
+    refreshTask(task, {
+      touchUpdatedAt: false,
+      exportJobsDirty: true
+    });
   } catch (error) {
     if (pulse) {
       clearInterval(pulse);
@@ -3309,7 +4529,10 @@ async function runExportJob(taskId, jobId) {
       totalSteps: 4
     });
     addActivity(task, "task_export_failed", "Task export failed", `${task.filename} export failed: ${job.errorMessage}`);
-    refreshTask(task, { touchUpdatedAt: false });
+    refreshTask(task, {
+      touchUpdatedAt: false,
+      exportJobsDirty: true
+    });
   }
 }
 
@@ -3346,7 +4569,10 @@ export function createExportJob(taskId, payload = {}) {
   exportJobs.unshift(job);
   task.exportJobs = exportJobs.slice(0, 12);
   addActivity(task, "task_export_queued", "Task export queued", `${task.filename} queued async export as ${formatOptionLabel(format, normalizedOptions)}.`);
-  refreshTask(task, { touchUpdatedAt: false });
+  refreshTask(task, {
+    touchUpdatedAt: false,
+    exportJobsDirty: true
+  });
   setTimeout(() => {
     void runExportJob(task.id, job.id);
   }, 0);
@@ -3416,10 +4642,9 @@ export async function exportTask(taskId, format, options = {}) {
   if (format === "pdf" || format === "pdf_bilingual") {
     artifact = await buildPdfExport(task, normalizedOptions);
   } else if (format === "epub" || format === "epub_bilingual") {
-    if (task.documentFormat !== "epub") {
-      throw createError(409, "export_not_supported", "EPUB export is only available for EPUB tasks.");
-    }
-    artifact = await buildEpubExport(task, normalizedOptions);
+    artifact = task.documentFormat === "epub"
+      ? await buildEpubExport(task, normalizedOptions)
+      : await buildMarkdownEpubExport(task, normalizedOptions);
   } else {
     artifact = clone(buildExports(task)[format]);
   }
@@ -3447,14 +4672,37 @@ export async function exportTask(taskId, format, options = {}) {
 }
 
 export function clearAllState() {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+    saveTimeout = null;
+  }
   for (const taskId of taskTimers.keys()) {
     clearTaskTimers(taskId);
   }
   tasks.clear();
+  dirtyTaskIds.clear();
+  dirtyBlockKeys.clear();
+  replacedTaskBlockIds.clear();
+  deletedTaskIds.clear();
+  dirtyExportJobTaskIds.clear();
   fs.rmSync(getExportCacheDir(), { recursive: true, force: true });
   resolvedExportCacheDir = "";
   runtimeSecrets.apiKey = "";
   runtimeSecrets.accessToken = "";
+  persistedSecrets.apiKey = "";
+  persistedSecrets.accessToken = "";
   appSettings = structuredClone(DEFAULT_SETTINGS);
   pendingStateSanitize = false;
+  settingsDirty = false;
+  secretsDirty = false;
+  closeStateDb();
+  if (DB_PATH !== ":memory:") {
+    fs.rmSync(DB_PATH, { force: true });
+    fs.rmSync(`${DB_PATH}-wal`, { force: true });
+    fs.rmSync(`${DB_PATH}-shm`, { force: true });
+  }
+  const shouldClearLegacyJson = CONFIGURED_STATE_PATH.endsWith(".json") || DB_PATH === DEFAULT_SQLITE_PATH;
+  if (shouldClearLegacyJson && LEGACY_JSON_STATE_PATH && LEGACY_JSON_STATE_PATH !== ":memory:" && LEGACY_JSON_STATE_PATH !== DB_PATH) {
+    fs.rmSync(LEGACY_JSON_STATE_PATH, { force: true });
+  }
 }

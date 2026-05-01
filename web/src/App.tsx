@@ -1,6 +1,6 @@
-import { BrowserRouter as Router, Routes, Route, NavLink } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, NavLink, Navigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
-import { Sun, Moon, LayoutDashboard, List, Settings } from 'lucide-react';
+import { Sun, Moon, LayoutDashboard, List, PanelLeftClose, PanelLeftOpen, Settings } from 'lucide-react';
 import { Client } from './api';
 import Dashboard from './pages/Dashboard';
 import TaskList from './pages/TaskList';
@@ -12,6 +12,7 @@ import { getAppRuntimeConfig } from './runtime';
 import './App.css';
 
 const runtime = getAppRuntimeConfig();
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'translate-book.sidebar-collapsed';
 
 function App() {
   const { locale, setLocale, t } = useI18n();
@@ -21,11 +22,19 @@ function App() {
     const stored = window.localStorage.getItem('translate-book.theme');
     return stored === 'dark' ? 'dark' : 'light';
   });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    const stored = window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+    return stored === '1';
+  });
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     window.localStorage.setItem('translate-book.theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed ? '1' : '0');
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     document.title = t('app.title');
@@ -71,83 +80,114 @@ function App() {
   return (
     <Router basename={runtime.basePath || undefined}>
       <div className="app-container">
-        <aside className="sidebar glass-panel">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-            <h2 style={{ fontSize: '1.25rem' }}>{t('app.title')}</h2>
-            <button
-              onClick={toggleTheme}
-              className="glass-button"
-              style={{ padding: '0.5rem', borderRadius: '50%' }}
-              title={t('app.toggleTheme')}
-            >
-              {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-            <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{t('app.language')}</span>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
-              {(['zh-CN', 'en'] as const).map((option) => (
+        {!sidebarCollapsed && (
+          <aside className="sidebar glass-panel">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+              <h2 style={{ fontSize: '1.25rem' }}>{t('app.title')}</h2>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <button
-                  key={option}
-                  type="button"
-                  className={`glass-button ${locale === option ? 'primary' : ''}`}
-                  onClick={() => setLocale(option)}
-                  style={{ padding: '0.55rem 0.75rem' }}
+                  onClick={() => setSidebarCollapsed(true)}
+                  className="glass-button"
+                  style={{ padding: '0.5rem', borderRadius: '50%' }}
+                  title={t('app.hideSidebar')}
                 >
-                  {t(`app.language.${option}`)}
+                  <PanelLeftClose size={18} />
                 </button>
-              ))}
+                <button
+                  onClick={toggleTheme}
+                  className="glass-button"
+                  style={{ padding: '0.5rem', borderRadius: '50%' }}
+                  title={t('app.toggleTheme')}
+                >
+                  {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
+                </button>
+              </div>
             </div>
-          </div>
 
-          <div style={{ height: '2px', background: 'var(--shadow-light)', margin: '0.5rem 0' }} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{t('app.language')}</span>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+                {(['zh-CN', 'en'] as const).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`glass-button ${locale === option ? 'primary' : ''}`}
+                    onClick={() => setLocale(option)}
+                    style={{ padding: '0.55rem 0.75rem' }}
+                  >
+                    {t(`app.language.${option}`)}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-          <nav style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
-            <NavLink
-              to="/"
-              className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
-              style={{ justifyContent: 'flex-start' }}
+            <div style={{ height: '2px', background: 'var(--shadow-light)', margin: '0.5rem 0' }} />
+
+            <nav style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
+              <NavLink
+                to="/"
+                className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
+                style={{ justifyContent: 'flex-start' }}
+              >
+                <LayoutDashboard size={18} />
+                <span>{t('app.newTask')}</span>
+              </NavLink>
+              <NavLink
+                to="/tasks"
+                className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
+                style={{ justifyContent: 'flex-start' }}
+              >
+                <List size={18} />
+                <span>{t('app.taskList')}</span>
+              </NavLink>
+              <NavLink
+                to="/settings"
+                className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
+                style={{ justifyContent: 'flex-start' }}
+              >
+                <Settings size={18} />
+                <span>{t('app.settings')}</span>
+              </NavLink>
+            </nav>
+
+            <div
+              id="sidebar-tool-slot"
+              style={{
+                marginTop: 'auto',
+                minHeight: '0',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '1rem'
+              }}
+            />
+          </aside>
+        )}
+
+        <main className="main-content" style={{ position: 'relative' }}>
+          {sidebarCollapsed && (
+            <button
+              type="button"
+              className="glass-button"
+              onClick={() => setSidebarCollapsed(false)}
+              title={t('app.showSidebar')}
+              style={{
+                position: 'sticky',
+                top: 0,
+                alignSelf: 'flex-start',
+                zIndex: 40,
+                padding: '0.6rem 0.9rem'
+              }}
             >
-              <LayoutDashboard size={18} />
-              <span>{t('app.newTask')}</span>
-            </NavLink>
-            <NavLink
-              to="/tasks"
-              className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
-              style={{ justifyContent: 'flex-start' }}
-            >
-              <List size={18} />
-              <span>{t('app.taskList')}</span>
-            </NavLink>
-            <NavLink
-              to="/settings"
-              className={({ isActive }) => `glass-button ${isActive ? 'primary' : ''}`}
-              style={{ justifyContent: 'flex-start' }}
-            >
-              <Settings size={18} />
-              <span>{t('app.settings')}</span>
-            </NavLink>
-          </nav>
-
-          <div
-            id="sidebar-tool-slot"
-            style={{
-              marginTop: 'auto',
-              minHeight: '0',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '1rem'
-            }}
-          />
-        </aside>
-
-        <main className="main-content">
+              <PanelLeftOpen size={18} />
+              <span>{t('app.showSidebar')}</span>
+            </button>
+          )}
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/tasks" element={<TaskList />} />
+            <Route path="/tasks/:taskId/focus" element={<Navigate to="/tasks" replace />} />
             <Route path="/tasks/:taskId" element={<TaskDetail />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/settings/*" element={<SettingsPage />} />
           </Routes>
         </main>
       </div>

@@ -20,6 +20,7 @@ WORKDIR /app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     python3 \
+    pandoc \
     chromium \
     fonts-noto-cjk \
     fontconfig \

@@ -111,6 +111,25 @@ export interface TaskPageBlock extends BlockStatus {
 export interface FailedBlockRef {
   id: string;
   order: number;
+  page?: number;
+}
+
+export interface TaskSearchMatch {
+  id: string;
+  order: number;
+  page: number;
+  status: string;
+  reviewState: 'none' | 'pending_confirmation' | 'confirmed' | 'ignored';
+  sourceExcerpt: string;
+  translatedExcerpt: string;
+}
+
+export interface TaskSearchResponse {
+  taskId: string;
+  query: string;
+  limit: number;
+  totalMatches: number;
+  matches: TaskSearchMatch[];
 }
 
 export interface TaskStatusResponse {
@@ -125,6 +144,7 @@ export interface TaskStatusResponse {
   totalPages: number;
   totalBlocks: number;
   failedBlocks: FailedBlockRef[];
+  attentionBlocks: FailedBlockRef[];
   summary: {
     translatedWordCount?: number;
     sourceWordCount?: number;
@@ -194,6 +214,7 @@ export interface ConnectionTestResult {
     ok: boolean;
     provider: string;
     model: string;
+    apiProtocol?: string;
     url: string;
     status: number;
     latencyMs: number;
@@ -246,7 +267,7 @@ export const Client = {
     const { data } = await api.post('/settings/access-token/dotenv', payload);
     return data as ApiResponse<any>;
   },
-  async clearApiKey(options: { scope?: 'session' | 'dotenv' | 'all' } = {}) {
+  async clearApiKey(options: { scope?: 'session' | 'database' | 'dotenv' | 'all' } = {}) {
     const params = new URLSearchParams();
     if (options.scope) {
       params.set('scope', options.scope);
@@ -255,7 +276,7 @@ export const Client = {
     const { data } = await api.delete('/settings/api-key' + suffix);
     return data as ApiResponse<any>;
   },
-  async clearAccessToken(options: { scope?: 'session' | 'dotenv' | 'all' } = {}) {
+  async clearAccessToken(options: { scope?: 'session' | 'database' | 'dotenv' | 'all' } = {}) {
     const params = new URLSearchParams();
     if (options.scope) {
       params.set('scope', options.scope);
@@ -326,6 +347,18 @@ export const Client = {
     const suffix = params.toString() ? `?${params.toString()}` : '';
     const { data } = await api.get(`/tasks/${id}/status${suffix}`);
     return data as ApiResponse<TaskStatusResponse>;
+  },
+  async searchTaskBlocks(id: string, options: { query: string; pageSize?: number; limit?: number } ) {
+    const params = new URLSearchParams();
+    params.set('q', options.query);
+    if (options.pageSize) {
+      params.set('pageSize', String(options.pageSize));
+    }
+    if (options.limit) {
+      params.set('limit', String(options.limit));
+    }
+    const { data } = await api.get(`/tasks/${id}/search?${params.toString()}`);
+    return data as ApiResponse<TaskSearchResponse>;
   },
   async startBlockTranslation(taskId: string, blockId: string) {
     const { data } = await api.post(`/tasks/${taskId}/blocks/${blockId}/translate`);

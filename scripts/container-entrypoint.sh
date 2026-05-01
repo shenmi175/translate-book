@@ -36,7 +36,7 @@ elif normalize_bool "$AUTO_GENERATE"; then
   export MARKDOWN_TRANSLATOR_ACCESS_TOKEN
   persist_token "$MARKDOWN_TRANSLATOR_ACCESS_TOKEN"
   log "Generated a new access token and stored it at ${TOKEN_FILE}."
-  log "Copy it from the host with: cat server/data/runtime/access-token"
+  log "Read it with: docker exec translate-book cat ${TOKEN_FILE}"
 else
   log "No access token provided and automatic generation is disabled."
 fi

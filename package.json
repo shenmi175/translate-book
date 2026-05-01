@@ -7,9 +7,9 @@
     "dev": "node scripts/dev.mjs",
     "dev:api": "node server/index.js",
     "dev:web": "npm run dev --prefix web",
-    "test": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/*.test.js",
-    "test:epub": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/epub-pipeline.test.js",
-    "test:exports": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.json MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/export-behavior.test.js"
+    "test": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/*.test.js",
+    "test:epub": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/epub-pipeline.test.js",
+    "test:exports": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/export-behavior.test.js"
   },
   "dependencies": {
     "mdast-util-from-markdown": "^2.0.2",
