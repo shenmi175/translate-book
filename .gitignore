@@ -1,7 +1,9 @@
 ﻿node_modules/
 web/node_modules/
 server/data/db.json
+server/data/app.sqlite*
 server/data/runtime/
+server/data/tasks/
 server/data/export-cache/
 .env
 .env.*
