@@ -9,18 +9,20 @@ FOLLOW_LOGS=0
 RESET_DATA=0
 BACKUP_DATA=1
 SMOKE_TEST=1
+NO_BUILD=0
 BASE_IMAGE="${TRANSLATE_BOOK_BASE_IMAGE:-node:22-bookworm-slim}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/rebuild-container.sh [--logs] [--reset-data] [--no-backup] [--no-smoke]
+  ./scripts/rebuild-container.sh [--logs] [--reset-data] [--no-backup] [--no-smoke] [--no-build]
 
 Options:
   --logs        Rebuild, start the container, then follow container logs.
   --reset-data  Remove SQLite data and export cache before rebuilding.
   --no-backup   Skip the pre-rebuild SQLite backup.
   --no-smoke    Skip the post-rebuild health and persistence checks.
+  --no-build    Start the last built image without contacting Docker Hub.
   --help        Show this help message.
 EOF
 }
@@ -49,6 +51,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-smoke)
       SMOKE_TEST=0
+      ;;
+    --no-build)
+      NO_BUILD=1
       ;;
     --help|-h)
       usage
@@ -128,6 +133,48 @@ run_compose_build_without_buildkit() {
 
   printf 'Docker Compose is not available.\n' >&2
   exit 1
+}
+
+print_docker_network_help() {
+  cat >&2 <<EOF
+
+Docker could not fetch metadata for ${BASE_IMAGE}.
+This is a Docker daemon DNS/network problem, not an application bug.
+
+Your shell/browser can use a proxy while the Docker daemon still connects directly.
+In an Ubuntu VM with v2rayN on the host, configure Docker daemon proxy inside the VM:
+
+  1. Enable "Allow LAN" in v2rayN and confirm the HTTP proxy port, for example 7890 or 10809.
+  2. In the Ubuntu VM, find the host/gateway address:
+       ip route | awk '/default/ {print \$3; exit}'
+  3. Verify the VM can reach the host proxy:
+       curl -I -x http://<gateway-ip>:<proxy-port> https://registry-1.docker.io/v2/
+     A 401 response is OK; timeout/refused means the proxy address or LAN setting is wrong.
+  4. Configure Docker daemon proxy:
+       sudo mkdir -p /etc/systemd/system/docker.service.d
+       sudo tee /etc/systemd/system/docker.service.d/proxy.conf >/dev/null <<'PROXY'
+       [Service]
+       Environment="HTTP_PROXY=http://<gateway-ip>:<proxy-port>"
+       Environment="HTTPS_PROXY=http://<gateway-ip>:<proxy-port>"
+       Environment="NO_PROXY=localhost,127.0.0.1,::1"
+       PROXY
+       sudo systemctl daemon-reload
+       sudo systemctl restart docker
+       sudo docker pull ${BASE_IMAGE}
+
+If DNS still fails after proxying Docker, set Docker daemon DNS in /etc/docker/daemon.json:
+
+  {
+    "dns": ["1.1.1.1", "8.8.8.8"]
+  }
+
+Then run:
+  sudo systemctl restart docker
+  ./scripts/rebuild-container.sh --logs
+
+To bring the app back with the last successfully built image while fixing networking:
+  ./scripts/rebuild-container.sh --no-build
+EOF
 }
 
 count_sqlite_table() {
@@ -341,21 +388,20 @@ if [ "$RESET_DATA" -eq 1 ]; then
   clear_data
 fi
 
-log "Building and starting ${SERVICE_NAME}"
-if ! run_compose up -d --build --force-recreate; then
-  if run_docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
-    log "Primary build failed. Retrying with local cached base image ${BASE_IMAGE} and BuildKit disabled"
-    run_compose_build_without_buildkit
-    run_compose up -d --force-recreate --no-build
-  else
-    printf '\nDocker could not fetch metadata for %s.\n' "${BASE_IMAGE}" >&2
-    printf 'This is a Docker daemon DNS/network problem, not an application bug.\n' >&2
-    printf 'Fix Docker networking first, then retry the rebuild script.\n' >&2
-    printf 'Suggested checks:\n' >&2
-    printf '  1. sudo docker pull %s\n' "${BASE_IMAGE}" >&2
-    printf '  2. sudo systemctl restart docker\n' >&2
-    printf '  3. If DNS keeps timing out, set Docker daemon DNS to 1.1.1.1 / 8.8.8.8 and restart Docker.\n' >&2
-    exit 1
+if [ "$NO_BUILD" -eq 1 ]; then
+  log "Starting ${SERVICE_NAME} from the last built image without rebuilding"
+  run_compose up -d --force-recreate --no-build
+else
+  log "Building and starting ${SERVICE_NAME}"
+  if ! run_compose up -d --build --force-recreate; then
+    if run_docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
+      log "Primary build failed. Retrying with local cached base image ${BASE_IMAGE} and BuildKit disabled"
+      run_compose_build_without_buildkit
+      run_compose up -d --force-recreate --no-build
+    else
+      print_docker_network_help
+      exit 1
+    fi
   fi
 fi
 

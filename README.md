@@ -81,8 +81,8 @@
 
 1. 准备一个可用的上游模型 `API Key`
 2. 执行 `./scripts/install-run.sh --docker`
-3. 执行 `cat server/data/runtime/access-token`，复制自动生成的访问令牌
-4. 打开 `http://localhost:8787`，先粘贴访问令牌，再去“设置”页填 `API Base URL`、`Model` 和 `API Key`，点击“保存引擎配置”后会自动写入 `.env`
+3. 打开 `http://localhost:8787`，首次进入会要求注册管理员账号
+4. 登录后去“设置”页填 `API Base URL`、`Model` 和 `API Key`，点击“保存引擎配置”后会自动写入 `.env`
 
 如果你想启动前就固定 API Key，也可以提前创建 `.env`：
 
@@ -94,18 +94,17 @@ PORT=8787
 说明：
 
 - `MARKDOWN_TRANSLATOR_API_KEY` 必须由你的模型服务商提供，项目不会自动生成它
-- `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 可以不写，容器首次启动时会自动生成
-- 如果你已经手动写了 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`，应用就直接使用你提供的值
+- 管理员账号保存在 SQLite 中，首次打开页面注册即可
+- `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 仍保留为兼容旧部署的 API 访问令牌，但普通 Web 使用建议走账号登录
 
 ### 第一次启动后你会看到什么
 
 Docker 首次启动成功后，建议按这个顺序操作：
 
 1. 执行 `docker logs --tail 50 translate-book`
-2. 执行 `cat server/data/runtime/access-token`
-3. 浏览器打开 `http://localhost:8787`
-4. 页面会先要求输入访问令牌
-5. 输入后进入应用，再去“设置”页补全模型配置
+2. 浏览器打开 `http://localhost:8787`
+3. 页面会先要求注册管理员账号
+4. 登录后进入应用，再去“设置”页补全模型配置
 6. 返回“新建任务”页上传 `.md` 或 `.epub`
 7. 创建任务后进入详情页开始翻译
 8. 翻译完成后从右上角导出 `Markdown`、`PDF`、`EPUB` 或双语版本
@@ -126,25 +125,7 @@ PORT=8787
 
 也可以不写 `.env`，启动后在 Web 设置页里填入。
 
-如果你准备把服务暴露到公网，建议同时设置：
-
-```dotenv
-MARKDOWN_TRANSLATOR_ACCESS_TOKEN=replace-this-with-a-long-random-token
-```
-
-设置后，除 `/api`、`/api/docs`、`/api/openapi.yaml` 外，其余 API 都需要携带访问令牌。
-
-如果你没有提供 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`，容器会在首次启动时自动生成一个高强度访问令牌，并持久化到：
-
-```text
-./server/data/runtime/access-token
-```
-
-你可以用下面这条命令直接查看并复制：
-
-```bash
-cat server/data/runtime/access-token
-```
+如果你准备把服务暴露到公网，首次打开页面后先注册管理员账号。注册成功后，任务、导出和设置 API 都需要登录会话或兼容访问令牌。
 
 2. 启动
 
@@ -152,7 +133,7 @@ cat server/data/runtime/access-token
 ./scripts/install-run.sh --docker
 ```
 
-`docker-compose.yml` 会自动把容器内可写 `.env` 指向 `./server/data/runtime/.env`，所以你在设置页保存的 API Key 会跟随 `server/data` 持久化；如果访问令牌为空，entrypoint 会在第一次启动时自动生成并落盘。
+`docker-compose.yml` 会自动把容器内可写 `.env` 指向 `./server/data/runtime/.env`，所以你在设置页保存的 API Key 会跟随 `server/data` 持久化；管理员账号、登录锁定状态和任务数据都保存在 `./server/data/app.sqlite`。
 
 3. 打开页面
 
@@ -255,21 +236,34 @@ MARKDOWN_TRANSLATOR_ACCESS_TOKEN=
 PORT=8787
 ```
 
-访问令牌支持来源：
+公网访问保护：
 
-1. 当前后端会话内保存的访问令牌
-2. 进程环境变量 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`
-3. 本地 `.env`
+1. 首选方式是首次打开页面注册管理员账号，然后使用用户名和密码登录
+2. 管理员账号、密码哈希、失败次数和锁定状态保存在 SQLite
+3. 连续 5 次登录失败后账号会锁定，前端不能解锁
+4. 兼容旧部署的 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN` 仍可继续作为 Bearer Token 使用
 
-访问令牌的用途：
+锁定后在服务器上重置密码：
+
+```bash
+docker exec -it translate-book node scripts/reset-admin-password.js --username admin --generate
+```
+
+也可以指定新密码：
+
+```bash
+docker exec -it translate-book node scripts/reset-admin-password.js --username admin --password 'your-new-password'
+```
+
+访问保护的用途：
 
 - 保护任务列表、任务详情、导出、设置等敏感 API
 - 防止把应用挂到公网后被任何人直接枚举和下载文档内容
 
-访问令牌不是模型 `API Key`，它们是两个完全不同的东西：
+登录密码 / 访问令牌都不是模型 `API Key`，它们是不同的东西：
 
 - `API Key`：用来访问上游模型服务
-- `Access Token`：用来保护你自己部署的这个应用
+- 管理员账号 / Access Token：用来保护你自己部署的这个应用
 
 设置页里的反代相关配置：
 
@@ -284,7 +278,7 @@ PORT=8787
 
 - 通过设置页“保存引擎配置”写入的 API Key 会直接保存到 `.env` 并立即生效
 - Docker 模式默认把 `.env` 写到已挂载的 `./server/data/runtime/.env`，它的优先级高于宿主机根目录 `.env` 透传进容器的环境变量，避免 Web 设置页保存后又被旧配置覆盖
-- 访问令牌仍可保存在 SQLite；只有你显式点击“写入 .env”时才会同步到本地文件，且该操作仍限制为服务器本机请求
+- 旧版访问令牌仍可使用；新部署建议使用管理员账号登录
 
 ## 使用流程
 
@@ -387,20 +381,19 @@ docker compose logs -f
 docker compose down
 ```
 
-查看当前实例访问令牌：
+重置管理员密码：
+
+```bash
+docker exec -it translate-book node scripts/reset-admin-password.js --username admin --generate
+```
+
+如果你仍在使用旧版访问令牌，可以查看当前实例访问令牌：
 
 ```bash
 cat server/data/runtime/access-token
 ```
 
-强制重新生成访问令牌：
-
-```bash
-rm -f server/data/runtime/access-token
-docker compose restart
-```
-
-如果你想固定一个自定义访问令牌，不要删文件后等它自动生成，直接在宿主机 `.env` 里写：
+如果你想固定一个自定义兼容访问令牌，可以在宿主机 `.env` 里写：
 
 ```dotenv
 MARKDOWN_TRANSLATOR_ACCESS_TOKEN=your-own-long-random-token
@@ -515,15 +508,22 @@ epub_bilingual
 - 上传、轮询、导出都走代理域名
 - 任务导出链接不是裸露的后端内网地址
 
-### 8. 手工验证访问令牌保护
+### 8. 手工验证登录保护
 
-1. 在设置页填入访问令牌并保存，或写入 `.env`
+1. 打开一个新的无痕窗口访问站点
+2. 首次部署时应出现管理员注册页；已有账号时应出现登录页
+3. 未登录时，任务列表、任务详情、导出接口都应返回 `401`
+4. 登录后，上传、轮询、导出应恢复正常
+5. 连续输错密码 5 次后账号应锁定，并提示到服务器执行 `reset-admin-password.js`
+
+### 9. 手工验证兼容访问令牌保护
+
+1. 如仍使用 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`，先确认代理会透传 `Authorization`
 2. 打开一个新的无痕窗口访问站点
-3. 首次进入时应弹出访问令牌输入框
-4. 未携带令牌时，任务列表、任务详情、导出接口都应返回 `401`
-5. 填入正确令牌后，上传、轮询、导出应恢复正常
+3. 未携带令牌时，任务列表、任务详情、导出接口都应返回 `401`
+4. 携带正确 Bearer Token 后，上传、轮询、导出应恢复正常
 
-### 9. 手工验证双语切换
+### 10. 手工验证双语切换
 
 打开左侧栏的语言切换按钮：
 
@@ -566,22 +566,21 @@ epub_bilingual
 - 容器环境变量里是否有 `MARKDOWN_TRANSLATOR_API_KEY`
 - 或者进入 Web 设置页重新保存 Key
 
-### 2. 第一次打开页面就要求访问令牌，但我不知道令牌是什么
+### 2. 忘记管理员密码或账号被锁定
 
-如果你没有在 `.env` 里手动指定访问令牌，Docker 容器会在首次启动时自动生成一个，并写入：
+连续 5 次登录失败会锁定账号。需要登录服务器后执行：
 
 ```bash
-cat server/data/runtime/access-token
+docker exec -it translate-book node scripts/reset-admin-password.js --username admin --generate
 ```
 
-把它复制到浏览器弹窗即可。
+脚本会输出新密码，并清除锁定状态。你也可以用 `--password 'your-new-password'` 指定密码。
 
 ### 3. 公网部署后接口不通或导出提示未授权
 
 优先检查：
 
-- 是否已经配置 `MARKDOWN_TRANSLATOR_ACCESS_TOKEN`
-- 浏览器是否已在弹窗或设置页保存访问令牌
+- 是否已经注册管理员账号并登录
 - 反向代理是否允许 `Authorization` 请求头透传
 - 如果是跨域访问，代理是否允许 `Content-Disposition` 响应头透出
 

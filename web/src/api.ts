@@ -82,7 +82,22 @@ export interface ApiResponse<T> {
 
 export interface ServiceOverview {
   authRequired?: boolean;
+  adminAuth?: AdminAuthState;
   [key: string]: any;
+}
+
+export interface AdminAuthState {
+  configured: boolean;
+  username: string;
+  locked: boolean;
+  lockedAt?: string;
+  failedAttempts: number;
+  maxFailedAttempts: number;
+}
+
+export interface AuthSessionResponse {
+  token: string;
+  auth: AdminAuthState;
 }
 
 export interface BlockStatus {
@@ -246,6 +261,26 @@ export const Client = {
   async getServiceOverview() {
     const { data } = await axios.get(`${runtime.basePath || ''}/api`);
     return data as ApiResponse<ServiceOverview>;
+  },
+  async getAuthStatus() {
+    const { data } = await axios.get(`${runtime.basePath || ''}/api/auth/status`);
+    return data as ApiResponse<AdminAuthState>;
+  },
+  async registerAdmin(payload: { username: string; password: string }) {
+    const { data } = await axios.post(`${runtime.basePath || ''}/api/auth/register`, payload);
+    return data as ApiResponse<AuthSessionResponse>;
+  },
+  async loginAdmin(payload: { username: string; password: string }) {
+    const { data } = await axios.post(`${runtime.basePath || ''}/api/auth/login`, payload);
+    return data as ApiResponse<AuthSessionResponse>;
+  },
+  async logoutAdmin() {
+    const { data } = await api.post('/auth/logout');
+    return data as ApiResponse<{ ok: boolean }>;
+  },
+  async updateAdminAccount(payload: { currentPassword: string; username?: string; password?: string }) {
+    const { data } = await api.put('/auth/account', payload);
+    return data as ApiResponse<{ auth: AdminAuthState }>;
   },
   async getSettings() {
     const { data } = await api.get('/settings');

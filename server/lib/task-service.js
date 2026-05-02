@@ -1,4 +1,4 @@
-﻿import { randomUUID } from "node:crypto";
+﻿import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import { readFile as readFileAsync, rm as rmAsync, writeFile as writeFileAsync } from "node:fs/promises";
 import os from "node:os";
@@ -172,9 +172,26 @@ function getStateDb() {
       payload_json TEXT NOT NULL,
       PRIMARY KEY(task_id, job_id)
     );
+    CREATE TABLE IF NOT EXISTS admin_auth (
+      id TEXT PRIMARY KEY CHECK(id = 'default'),
+      username TEXT NOT NULL UNIQUE,
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_at TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_blocks_task_order ON task_blocks(task_id, order_index ASC);
     CREATE INDEX IF NOT EXISTS idx_task_export_jobs_task_created ON task_export_jobs(task_id, created_at DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_auth_sessions_expires ON admin_auth_sessions(expires_at);
     CREATE VIRTUAL TABLE IF NOT EXISTS task_blocks_fts USING fts5(
       task_id UNINDEXED,
       block_id UNINDEXED,
@@ -573,6 +590,9 @@ const MANAGED_ACCESS_TOKEN_DOTENV_KEY = "MARKDOWN_TRANSLATOR_ACCESS_TOKEN";
 const DOTENV_ACCESS_TOKEN_KEYS = [MANAGED_ACCESS_TOKEN_DOTENV_KEY];
 const PERSISTED_API_KEY_META_KEY = "secret_api_key";
 const PERSISTED_ACCESS_TOKEN_META_KEY = "secret_access_token";
+const ADMIN_AUTH_ID = "default";
+const ADMIN_AUTH_MAX_FAILED_ATTEMPTS = 5;
+const ADMIN_AUTH_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const runtimeSecrets = {
   apiKey: "",
   accessToken: ""
@@ -620,6 +640,7 @@ function stripSecretFields(settings = {}) {
   delete next.accessTokenDotenvPath;
   delete next.accessTokenMutationGuard;
   delete next.authRequired;
+  delete next.adminAuth;
   return next;
 }
 
@@ -1174,6 +1195,7 @@ function normalizePersistedSettings(settings = {}) {
   delete next.accessTokenPersistence;
   delete next.accessTokenDotenvPath;
   delete next.authRequired;
+  delete next.adminAuth;
   return next;
 }
 
@@ -1698,6 +1720,228 @@ function maskSecret(secret = "") {
   if (!secret) return "";
   if (secret.length <= 4) return "*".repeat(secret.length);
   return `${"*".repeat(secret.length - 4)}${secret.slice(-4)}`;
+}
+
+function normalizeAdminUsername(value = "") {
+  const username = requireNonEmptyString(value, "username");
+  if (username.length < 3 || username.length > 64) {
+    throw createError(400, "invalid_request", "username must be between 3 and 64 characters.");
+  }
+  if (!/^[A-Za-z0-9_.@-]+$/.test(username)) {
+    throw createError(400, "invalid_request", "username may only contain letters, numbers, dot, underscore, hyphen, and @.");
+  }
+  return username;
+}
+
+function normalizeAdminPassword(value = "", fieldName = "password") {
+  const password = requireNonEmptyString(value, fieldName);
+  if (password.length < 8) {
+    throw createError(400, "invalid_request", `${fieldName} must be at least 8 characters.`);
+  }
+  return password;
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString("base64url");
+  const hash = scryptSync(password, salt, 64).toString("base64url");
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, expectedHash) {
+  if (!password || !salt || !expectedHash) {
+    return false;
+  }
+  const actual = scryptSync(password, salt, 64);
+  const expected = Buffer.from(expectedHash, "base64url");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function hashAuthToken(token = "") {
+  return createHash("sha256").update(String(token || ""), "utf8").digest("base64url");
+}
+
+function authSessionExpiry() {
+  return new Date(Date.now() + ADMIN_AUTH_SESSION_TTL_MS).toISOString();
+}
+
+function getAdminAuthRow() {
+  return getStateDb().prepare("SELECT * FROM admin_auth WHERE id = ?").get(ADMIN_AUTH_ID) || null;
+}
+
+function cleanupExpiredAdminSessions() {
+  getStateDb().prepare("DELETE FROM admin_auth_sessions WHERE expires_at <= ?").run(now());
+}
+
+function sanitizeAdminAuth(row = getAdminAuthRow()) {
+  return {
+    configured: Boolean(row),
+    username: row?.username || "",
+    locked: Boolean(row?.locked_at),
+    lockedAt: row?.locked_at || "",
+    failedAttempts: Number(row?.failed_attempts || 0),
+    maxFailedAttempts: ADMIN_AUTH_MAX_FAILED_ATTEMPTS
+  };
+}
+
+function createAdminSession(username) {
+  cleanupExpiredAdminSessions();
+  const token = randomBytes(32).toString("base64url");
+  const createdAt = now();
+  getStateDb().prepare(`
+    INSERT INTO admin_auth_sessions(token_hash, username, created_at, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run(hashAuthToken(token), username, createdAt, authSessionExpiry());
+  return token;
+}
+
+export function getAdminAuthState() {
+  return sanitizeAdminAuth();
+}
+
+export function isAdminAuthConfigured() {
+  return Boolean(getAdminAuthRow());
+}
+
+export function verifyAdminAuthSession(token = "") {
+  const normalized = typeof token === "string" ? token.trim() : "";
+  if (!normalized) {
+    return false;
+  }
+  cleanupExpiredAdminSessions();
+  const row = getStateDb().prepare(`
+    SELECT token_hash
+    FROM admin_auth_sessions
+    WHERE token_hash = ? AND expires_at > ?
+  `).get(hashAuthToken(normalized), now());
+  return Boolean(row);
+}
+
+export function registerAdminAccount(payload = {}) {
+  if (getAdminAuthRow()) {
+    throw createError(409, "admin_already_configured", "An administrator account already exists.");
+  }
+  const username = normalizeAdminUsername(payload?.username);
+  const password = normalizeAdminPassword(payload?.password);
+  const { salt, hash } = hashPassword(password);
+  const createdAt = now();
+  getStateDb().prepare(`
+    INSERT INTO admin_auth(id, username, password_salt, password_hash, failed_attempts, locked_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 0, '', ?, ?)
+  `).run(ADMIN_AUTH_ID, username, salt, hash, createdAt, createdAt);
+
+  return {
+    token: createAdminSession(username),
+    auth: sanitizeAdminAuth()
+  };
+}
+
+export function loginAdminAccount(payload = {}) {
+  const row = getAdminAuthRow();
+  if (!row) {
+    throw createError(404, "admin_setup_required", "No administrator account exists. Register the first administrator account.");
+  }
+  if (row.locked_at) {
+    throw createError(423, "admin_locked", "Administrator account is locked. Reset the password on the server.");
+  }
+
+  const username = normalizeAdminUsername(payload?.username);
+  const password = requireNonEmptyString(payload?.password, "password");
+  const passwordOk = username === row.username && verifyPassword(password, row.password_salt, row.password_hash);
+
+  if (!passwordOk) {
+    const failedAttempts = Number(row.failed_attempts || 0) + 1;
+    const lockedAt = failedAttempts >= ADMIN_AUTH_MAX_FAILED_ATTEMPTS ? now() : "";
+    getStateDb().prepare(`
+      UPDATE admin_auth
+      SET failed_attempts = ?, locked_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(failedAttempts, lockedAt, now(), ADMIN_AUTH_ID);
+    if (lockedAt) {
+      getStateDb().prepare("DELETE FROM admin_auth_sessions").run();
+    }
+    const remainingAttempts = Math.max(0, ADMIN_AUTH_MAX_FAILED_ATTEMPTS - failedAttempts);
+    throw createError(
+      lockedAt ? 423 : 401,
+      lockedAt ? "admin_locked" : "invalid_credentials",
+      lockedAt
+        ? "Administrator account is locked. Reset the password on the server."
+        : `Invalid username or password. ${remainingAttempts} attempts remaining.`,
+      { remainingAttempts, maxFailedAttempts: ADMIN_AUTH_MAX_FAILED_ATTEMPTS }
+    );
+  }
+
+  getStateDb().prepare(`
+    UPDATE admin_auth
+    SET failed_attempts = 0, locked_at = '', updated_at = ?
+    WHERE id = ?
+  `).run(now(), ADMIN_AUTH_ID);
+
+  return {
+    token: createAdminSession(row.username),
+    auth: sanitizeAdminAuth(getAdminAuthRow())
+  };
+}
+
+export function logoutAdminSession(token = "") {
+  const normalized = typeof token === "string" ? token.trim() : "";
+  if (normalized) {
+    getStateDb().prepare("DELETE FROM admin_auth_sessions WHERE token_hash = ?").run(hashAuthToken(normalized));
+  }
+  return { ok: true };
+}
+
+export function updateAdminAccount(payload = {}) {
+  const row = getAdminAuthRow();
+  if (!row) {
+    throw createError(404, "admin_setup_required", "No administrator account exists.");
+  }
+  if (row.locked_at) {
+    throw createError(423, "admin_locked", "Administrator account is locked. Reset the password on the server.");
+  }
+
+  const currentPassword = requireNonEmptyString(payload?.currentPassword, "currentPassword");
+  if (!verifyPassword(currentPassword, row.password_salt, row.password_hash)) {
+    throw createError(401, "invalid_credentials", "Current password is incorrect.");
+  }
+
+  const nextUsername = payload?.username === undefined || payload.username === "" ? row.username : normalizeAdminUsername(payload.username);
+  const nextPassword = payload?.password === undefined || payload.password === "" ? "" : normalizeAdminPassword(payload.password);
+  const passwordParts = nextPassword ? hashPassword(nextPassword) : { salt: row.password_salt, hash: row.password_hash };
+  getStateDb().prepare(`
+    UPDATE admin_auth
+    SET username = ?, password_salt = ?, password_hash = ?, failed_attempts = 0, locked_at = '', updated_at = ?
+    WHERE id = ?
+  `).run(nextUsername, passwordParts.salt, passwordParts.hash, now(), ADMIN_AUTH_ID);
+
+  return {
+    auth: sanitizeAdminAuth(getAdminAuthRow())
+  };
+}
+
+export function resetAdminPasswordFromServer(payload = {}) {
+  const username = normalizeAdminUsername(payload?.username || "admin");
+  const password = normalizeAdminPassword(payload?.password);
+  const { salt, hash } = hashPassword(password);
+  const existing = getAdminAuthRow();
+  const timestamp = now();
+
+  if (existing) {
+    getStateDb().prepare(`
+      UPDATE admin_auth
+      SET username = ?, password_salt = ?, password_hash = ?, failed_attempts = 0, locked_at = '', updated_at = ?
+      WHERE id = ?
+    `).run(username, salt, hash, timestamp, ADMIN_AUTH_ID);
+  } else {
+    getStateDb().prepare(`
+      INSERT INTO admin_auth(id, username, password_salt, password_hash, failed_attempts, locked_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 0, '', ?, ?)
+    `).run(ADMIN_AUTH_ID, username, salt, hash, timestamp, timestamp);
+  }
+
+  getStateDb().prepare("DELETE FROM admin_auth_sessions").run();
+  return {
+    auth: sanitizeAdminAuth(getAdminAuthRow())
+  };
 }
 
 function parseTaskMarkdown(content) {
@@ -2408,7 +2652,8 @@ function sanitizeConfig(config) {
             ? "environment"
             : "none";
   next.accessTokenDotenvPath = DOTENV_PATH;
-  next.authRequired = Boolean(resolvedAccessToken.value);
+  next.authRequired = Boolean(resolvedAccessToken.value) || isAdminAuthConfigured();
+  next.adminAuth = getAdminAuthState();
   next.apiKeyMutationGuard = "settings-save-dotenv";
   next.accessTokenMutationGuard = "loopback-only";
   next.effectiveApiEndpoint = buildEffectiveApiEndpoint(next.apiBaseUrl, next.apiProtocol);
@@ -2469,7 +2714,8 @@ function buildTaskConfig(config = {}) {
   merged.apiKeyDotenvPath = resolvedApiKey.source === "dotenv" && resolvedApiKey.storagePath ? resolvedApiKey.storagePath : DOTENV_PATH;
   merged.accessTokenDotenvPath = DOTENV_PATH;
   merged.stateStorePath = DB_PATH;
-  merged.authRequired = Boolean(resolvedAccessToken.value);
+  merged.authRequired = Boolean(resolvedAccessToken.value) || isAdminAuthConfigured();
+  merged.adminAuth = getAdminAuthState();
   merged.apiProtocol = normalizeApiProtocol(merged.apiProtocol);
 
   return merged;
@@ -3541,6 +3787,7 @@ function validateAnnotation(annotation) {
 
 export function getServiceOverview(context = {}) {
   const accessToken = getResolvedAccessToken();
+  const adminAuth = getAdminAuthState();
   const publicBaseUrl =
     typeof context === "string"
       ? context
@@ -3557,7 +3804,8 @@ export function getServiceOverview(context = {}) {
     service: SERVICE_INFO,
     publicBaseUrl,
     baseUrl: publicBaseUrl ? `${publicBaseUrl}/api` : "",
-    authRequired: Boolean(accessToken.value),
+    authRequired: Boolean(accessToken.value) || adminAuth.configured,
+    adminAuth,
     docsPath,
     openApiPath,
     healthPath

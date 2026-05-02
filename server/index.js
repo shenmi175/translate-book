@@ -19,13 +19,18 @@ import {
   getServiceOverview,
   getSettings,
   getResolvedAccessTokenState,
+  getAdminAuthState,
   getTask,
   getTaskStatus,
+  isAdminAuthConfigured,
   listTasks,
+  loginAdminAccount,
+  logoutAdminSession,
   pauseTask,
   persistApiKeyToDotenv,
   persistAccessTokenToDotenv,
   readExportJobArtifact,
+  registerAdminAccount,
   testProviderConnection,
   resumeTask,
   reparseTask,
@@ -36,7 +41,9 @@ import {
   startBlockTranslation,
   startTaskTranslation,
   updateBlock,
-  updateSettings
+  updateAdminAccount,
+  updateSettings,
+  verifyAdminAuthSession
 } from "./lib/task-service.js";
 import { buildApiDocs } from "./lib/api-docs.js";
 
@@ -283,16 +290,28 @@ function requiresApiAuthorization(pathname) {
     return false;
   }
 
-  return !["/api", "/api/docs", "/api/openapi.yaml"].includes(pathname);
+  return ![
+    "/api",
+    "/api/docs",
+    "/api/openapi.yaml",
+    "/api/auth/status",
+    "/api/auth/register",
+    "/api/auth/login"
+  ].includes(pathname);
 }
 
 function isAuthenticatedApiRequest(request, pathname) {
-  const expectedToken = getResolvedAccessTokenState().value;
-  if (!expectedToken || !requiresApiAuthorization(pathname)) {
+  if (!requiresApiAuthorization(pathname)) {
     return false;
   }
 
-  return presentedAccessTokenOf(request) === expectedToken;
+  const presentedToken = presentedAccessTokenOf(request);
+  if (verifyAdminAuthSession(presentedToken)) {
+    return true;
+  }
+
+  const expectedToken = getResolvedAccessTokenState().value;
+  return Boolean(expectedToken) && presentedToken === expectedToken;
 }
 
 function assertAuthorizedApiRequest(request, pathname) {
@@ -301,11 +320,12 @@ function assertAuthorizedApiRequest(request, pathname) {
   }
 
   const expectedToken = getResolvedAccessTokenState().value;
-  if (!expectedToken || !requiresApiAuthorization(pathname)) {
+  const authRequired = Boolean(expectedToken) || isAdminAuthConfigured();
+  if (!authRequired || !requiresApiAuthorization(pathname)) {
     return;
   }
 
-  const error = new Error("A valid access token is required for this API.");
+  const error = new Error("Login is required for this API.");
   error.statusCode = 401;
   error.code = "unauthorized";
   throw error;
@@ -596,6 +616,34 @@ const server = createServer(async (request, response) => {
 
     if (pathname === "/api/docs" && request.method === "GET") {
       sendSuccess(response, 200, buildApiDocs(runtime.publicBaseUrl));
+      return;
+    }
+
+    if (pathname === "/api/auth/status" && request.method === "GET") {
+      sendSuccess(response, 200, getAdminAuthState());
+      return;
+    }
+
+    if (pathname === "/api/auth/register" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      sendSuccess(response, 201, registerAdminAccount(body));
+      return;
+    }
+
+    if (pathname === "/api/auth/login" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      sendSuccess(response, 200, loginAdminAccount(body));
+      return;
+    }
+
+    if (pathname === "/api/auth/logout" && request.method === "POST") {
+      sendSuccess(response, 200, logoutAdminSession(presentedAccessTokenOf(request)));
+      return;
+    }
+
+    if (pathname === "/api/auth/account" && request.method === "PUT") {
+      const body = await readJsonBody(request);
+      sendSuccess(response, 200, updateAdminAccount(body));
       return;
     }
 

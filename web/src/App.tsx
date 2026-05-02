@@ -1,7 +1,7 @@
 import { BrowserRouter as Router, Routes, Route, NavLink, Navigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
-import { Sun, Moon, LayoutDashboard, List, PanelLeftClose, PanelLeftOpen, Settings } from 'lucide-react';
-import { Client } from './api';
+import { Sun, Moon, LayoutDashboard, List, LogOut, PanelLeftClose, PanelLeftOpen, Settings, ShieldCheck } from 'lucide-react';
+import { Client, type AdminAuthState } from './api';
 import Dashboard from './pages/Dashboard';
 import TaskList from './pages/TaskList';
 import TaskDetail from './pages/TaskDetail';
@@ -14,10 +14,117 @@ import './App.css';
 const runtime = getAppRuntimeConfig();
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'translate-book.sidebar-collapsed';
 
+function extractAuthError(error: any, fallback: string) {
+  return error?.response?.data?.error?.message || error?.message || fallback;
+}
+
+function AuthGate({
+  auth,
+  onAuthenticated
+}: {
+  auth: AdminAuthState | null;
+  onAuthenticated: (auth: AdminAuthState) => void;
+}) {
+  const { t } = useI18n();
+  const setupMode = !auth?.configured;
+  const locked = Boolean(auth?.locked);
+  const [username, setUsername] = useState(auth?.username || 'admin');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setUsername(auth?.username || 'admin');
+  }, [auth?.username]);
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (locked) {
+      return;
+    }
+    if (setupMode && password !== confirmPassword) {
+      setError(t('auth.passwordMismatch'));
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    try {
+      const res = setupMode
+        ? await Client.registerAdmin({ username, password })
+        : await Client.loginAdmin({ username, password });
+      if (res.success && res.data?.token) {
+        setStoredAccessToken(res.data.token);
+        onAuthenticated(res.data.auth);
+        return;
+      }
+      setError(res.error?.message || t('auth.failed'));
+    } catch (loginError: any) {
+      setError(extractAuthError(loginError, t('auth.failed')));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: '1.5rem' }}>
+      <form className="glass-panel" onSubmit={handleSubmit} style={{ width: '100%', maxWidth: '460px', padding: '2rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
+          <div className="glass-button primary" style={{ padding: '0.75rem', borderRadius: '16px' }}>
+            <ShieldCheck size={22} />
+          </div>
+          <div>
+            <h1 style={{ margin: 0, fontSize: '1.45rem' }}>{setupMode ? t('auth.registerTitle') : t('auth.loginTitle')}</h1>
+            <p style={{ margin: '0.45rem 0 0', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+              {locked ? t('auth.lockedDescription') : setupMode ? t('auth.registerDescription') : t('auth.loginDescription')}
+            </p>
+          </div>
+        </div>
+
+        {locked ? (
+          <div style={{ color: 'var(--danger-color)', lineHeight: 1.8 }}>
+            <div>{t('auth.lockedTitle')}</div>
+            <pre style={{ whiteSpace: 'pre-wrap', margin: '0.75rem 0 0', padding: '0.9rem', borderRadius: '12px', background: 'var(--shadow-light)', color: 'var(--text-primary)' }}>
+              docker exec -it translate-book node scripts/reset-admin-password.js --username {username || 'admin'} --generate
+            </pre>
+          </div>
+        ) : (
+          <>
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 700 }}>{t('auth.username')}</label>
+              <input className="glass-input" value={username} onChange={(event) => setUsername(event.target.value)} autoFocus />
+            </div>
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 700 }}>{t('auth.password')}</label>
+              <input className="glass-input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            </div>
+            {setupMode ? (
+              <div>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 700 }}>{t('auth.confirmPassword')}</label>
+                <input className="glass-input" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+              </div>
+            ) : null}
+          </>
+        )}
+
+        {error ? <div style={{ color: 'var(--danger-color)', lineHeight: 1.7 }}>{error}</div> : null}
+
+        {!locked ? (
+          <button type="submit" className="glass-button primary" disabled={busy || !username.trim() || !password} style={{ padding: '0.85rem 1.4rem', justifyContent: 'center' }}>
+            {busy ? t('auth.submitting') : setupMode ? t('auth.registerAction') : t('auth.loginAction')}
+          </button>
+        ) : null}
+      </form>
+    </div>
+  );
+}
+
 function App() {
   const { locale, setLocale, t } = useI18n();
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
-  const [browserAccessToken, setBrowserAccessToken] = useState(() => getStoredAccessToken());
+  const [authRequired, setAuthRequired] = useState(false);
+  const [adminAuth, setAdminAuth] = useState<AdminAuthState | null>(null);
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const stored = window.localStorage.getItem('translate-book.theme');
     return stored === 'dark' ? 'dark' : 'light';
@@ -41,7 +148,7 @@ function App() {
   }, [t]);
 
   useEffect(() => subscribeAuthRequired(() => {
-    setBrowserAccessToken(getStoredAccessToken());
+    clearStoredAccessToken();
     setAuthPromptOpen(true);
   }), []);
 
@@ -49,11 +156,14 @@ function App() {
     let cancelled = false;
     void Client.getServiceOverview()
       .then((res) => {
-        if (cancelled || !res.success || !res.data?.authRequired || getStoredAccessToken()) {
+        if (cancelled || !res.success) {
           return;
         }
-        setBrowserAccessToken('');
-        setAuthPromptOpen(true);
+        setAuthRequired(Boolean(res.data?.authRequired));
+        setAdminAuth(res.data?.adminAuth || null);
+        if (res.data?.authRequired && !getStoredAccessToken()) {
+          setAuthPromptOpen(true);
+        }
       })
       .catch(() => {});
     return () => {
@@ -65,17 +175,30 @@ function App() {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
   };
 
-  const handleAuthSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
-    setStoredAccessToken(browserAccessToken);
-    setAuthPromptOpen(false);
-    window.location.reload();
+  const handleLogout = async () => {
+    try {
+      await Client.logoutAdmin();
+    } catch {
+      // The local token must still be cleared even if the server session already expired.
+    }
+    clearStoredAccessToken();
+    setAuthPromptOpen(true);
   };
 
-  const handleAuthClear = () => {
-    clearStoredAccessToken();
-    setBrowserAccessToken('');
-  };
+  const shouldShowAuthGate = authRequired && (authPromptOpen || !getStoredAccessToken());
+
+  if (shouldShowAuthGate) {
+    return (
+      <AuthGate
+        auth={adminAuth}
+        onAuthenticated={(nextAuth) => {
+          setAdminAuth(nextAuth);
+          setAuthRequired(true);
+          setAuthPromptOpen(false);
+        }}
+      />
+    );
+  }
 
   return (
     <Router basename={runtime.basePath || undefined}>
@@ -160,6 +283,12 @@ function App() {
                 gap: '1rem'
               }}
             />
+            {authRequired ? (
+              <button type="button" className="glass-button" onClick={() => void handleLogout()} style={{ justifyContent: 'flex-start' }}>
+                <LogOut size={18} />
+                <span>{t('auth.logout')}</span>
+              </button>
+            ) : null}
           </aside>
         )}
 
@@ -191,38 +320,6 @@ function App() {
           </Routes>
         </main>
       </div>
-      {authPromptOpen && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.42)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1.5rem', zIndex: 1000000 }}>
-          <form className="glass-panel" onSubmit={handleAuthSubmit} style={{ width: '100%', maxWidth: '440px', padding: '1.75rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-            <div>
-              <h2 style={{ margin: 0, fontSize: '1.35rem' }}>{t('auth.title')}</h2>
-              <p style={{ margin: '0.75rem 0 0', color: 'var(--text-secondary)', lineHeight: 1.7 }}>{t('auth.description')}</p>
-            </div>
-            <div>
-              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('auth.input')}</label>
-              <input
-                type="password"
-                className="glass-input"
-                value={browserAccessToken}
-                onChange={(event) => setBrowserAccessToken(event.target.value)}
-                placeholder="translator-access-token"
-                autoFocus
-              />
-            </div>
-            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-              <button type="submit" className="glass-button primary" style={{ padding: '0.75rem 1.4rem' }}>
-                {t('auth.save')}
-              </button>
-              <button type="button" className="glass-button" onClick={handleAuthClear} style={{ padding: '0.75rem 1.4rem' }}>
-                {t('auth.clear')}
-              </button>
-              <button type="button" className="glass-button" onClick={() => setAuthPromptOpen(false)} style={{ padding: '0.75rem 1.4rem' }}>
-                {t('auth.cancel')}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
     </Router>
   );
 }

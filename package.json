@@ -8,6 +8,7 @@
     "dev:api": "node server/index.js",
     "dev:web": "npm run dev --prefix web",
     "test": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/*.test.js",
+    "test:auth": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-auth-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-auth-export-cache node --test test/auth.test.js",
     "test:epub": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/epub-pipeline.test.js",
     "test:exports": "MARKDOWN_TRANSLATOR_DB_PATH=/tmp/translate-book-test-db.sqlite MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR=/tmp/translate-book-test-export-cache node --test test/export-behavior.test.js"
   },

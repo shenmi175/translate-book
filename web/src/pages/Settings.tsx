@@ -13,8 +13,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { NavLink, Navigate, useLocation } from 'react-router-dom';
-import { Client, type ConnectionTestResult } from '../api';
-import { clearStoredAccessToken, setStoredAccessToken } from '../auth';
+import { Client, type AdminAuthState, type ConnectionTestResult } from '../api';
 import { useI18n } from '../i18n';
 import { getAppRuntimeConfig } from '../runtime';
 
@@ -23,7 +22,6 @@ type SettingsForm = {
   apiBaseUrl: string;
   apiProtocol: string;
   apiKey: string;
-  accessToken: string;
   model: string;
   targetLanguage: string;
   style: string;
@@ -61,6 +59,7 @@ type SettingsResponse = {
   accessTokenDotenvPath?: string;
   stateStorePath?: string;
   authRequired?: boolean;
+  adminAuth?: AdminAuthState;
   effectiveApiEndpoint?: string;
 };
 
@@ -71,7 +70,6 @@ const DEFAULT_FORM: SettingsForm = {
   apiBaseUrl: 'https://api.deepseek.com',
   apiProtocol: 'chat_completions',
   apiKey: '',
-  accessToken: '',
   model: 'deepseek-chat',
   targetLanguage: 'Chinese',
   style: 'Accurate, natural, professional, concise',
@@ -214,6 +212,13 @@ export default function Settings() {
   const [accessTokenPersistence, setAccessTokenPersistence] = useState('none');
   const [accessTokenStorageKey, setAccessTokenStorageKey] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
+  const [adminAuth, setAdminAuth] = useState<AdminAuthState | null>(null);
+  const [accountForm, setAccountForm] = useState({
+    username: '',
+    currentPassword: '',
+    password: '',
+    confirmPassword: ''
+  });
   const [dotenvPath, setDotenvPath] = useState('');
   const [stateStorePath, setStateStorePath] = useState('');
   const [effectiveApiEndpoint, setEffectiveApiEndpoint] = useState('');
@@ -225,9 +230,8 @@ export default function Settings() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [savingSection, setSavingSection] = useState<SettingsSectionKey | null>(null);
-  const [persistingAccessTokenDotenv, setPersistingAccessTokenDotenv] = useState(false);
+  const [savingAccount, setSavingAccount] = useState(false);
   const [clearingKey, setClearingKey] = useState(false);
-  const [clearingAccessToken, setClearingAccessToken] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionTest, setConnectionTest] = useState<ConnectionTestResult | null>(null);
   const [viewportWidth, setViewportWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 1440));
@@ -245,6 +249,14 @@ export default function Settings() {
     setAccessTokenPersistence(data?.accessTokenPersistence || 'none');
     setAccessTokenStorageKey(data?.accessTokenStorageKey || 'MARKDOWN_TRANSLATOR_ACCESS_TOKEN');
     setAuthRequired(Boolean(data?.authRequired));
+    setAdminAuth(data?.adminAuth || null);
+    setAccountForm((current) => ({
+      ...current,
+      username: data?.adminAuth?.username || current.username || 'admin',
+      currentPassword: '',
+      password: '',
+      confirmPassword: ''
+    }));
     setDotenvPath(data?.apiKeyDotenvPath || data?.accessTokenDotenvPath || '.env');
     setStateStorePath(data?.stateStorePath || '');
     setEffectiveApiEndpoint(data?.effectiveApiEndpoint || '');
@@ -258,7 +270,6 @@ export default function Settings() {
       apiBaseUrl: data?.apiBaseUrl || DEFAULT_FORM.apiBaseUrl,
       apiProtocol: data?.apiProtocol || DEFAULT_FORM.apiProtocol,
       apiKey: '',
-      accessToken: '',
       model: data?.model || DEFAULT_FORM.model,
       targetLanguage: data?.targetLanguage || DEFAULT_FORM.targetLanguage,
       style: data?.style || DEFAULT_FORM.style,
@@ -299,14 +310,11 @@ export default function Settings() {
   const publicUrls = useMemo(() => derivePublicUrls(settings.publicBaseUrl), [settings.publicBaseUrl]);
   const activeProtocolLabel = activeProtocol === 'responses' ? t('settings.protocolResponses') : t('settings.protocolChatCompletions');
 
-  const savePatch = async (section: SettingsSectionKey, payload: Record<string, unknown>, options: { storeAccessToken?: string } = {}) => {
+  const savePatch = async (section: SettingsSectionKey, payload: Record<string, unknown>) => {
     setSavingSection(section);
     try {
       const res = await Client.updateSettings(payload);
       if (res.success && res.data) {
-        if (options.storeAccessToken) {
-          setStoredAccessToken(options.storeAccessToken);
-        }
         syncFromResponse(res.data);
         alert(t('settings.saved'));
       } else {
@@ -350,16 +358,37 @@ export default function Settings() {
     });
   };
 
-  const handleSaveSecurity = async () => {
-    if (!settings.accessToken.trim()) {
+  const handleSaveAdminAccount = async () => {
+    if (accountForm.password && accountForm.password !== accountForm.confirmPassword) {
+      alert(t('settings.adminPasswordMismatch'));
       return;
     }
 
-    await savePatch(
-      'security',
-      { accessToken: settings.accessToken.trim() },
-      { storeAccessToken: settings.accessToken.trim() }
-    );
+    setSavingAccount(true);
+    try {
+      const res = await Client.updateAdminAccount({
+        currentPassword: accountForm.currentPassword,
+        username: accountForm.username.trim(),
+        password: accountForm.password.trim() || undefined
+      });
+      if (res.success && res.data?.auth) {
+        setAdminAuth(res.data.auth);
+        setAccountForm({
+          username: res.data.auth.username || accountForm.username,
+          currentPassword: '',
+          password: '',
+          confirmPassword: ''
+        });
+        alert(t('settings.adminAccountSaved'));
+      } else {
+        alert(t('settings.adminAccountSaveFailed', { message: res.error?.message || t('common.failed') }));
+      }
+    } catch (error) {
+      console.error(error);
+      alert(extractApiErrorMessage(error, t('settings.adminAccountSaveNetworkError')));
+    } finally {
+      setSavingAccount(false);
+    }
   };
 
   const handleClearKey = async () => {
@@ -379,61 +408,6 @@ export default function Settings() {
       alert(extractApiErrorMessage(error, t('settings.keyDeleteNetworkError')));
     } finally {
       setClearingKey(false);
-    }
-  };
-
-  const handleClearAccessToken = async () => {
-    setClearingAccessToken(true);
-    try {
-      const scope = accessTokenSource === 'dotenv' ? 'all' : accessTokenSource === 'database' ? 'database' : 'session';
-      const res = await Client.clearAccessToken({ scope });
-      if (res.success && res.data) {
-        syncFromResponse(res.data);
-        clearStoredAccessToken();
-        setSettings((current) => ({ ...current, accessToken: '' }));
-        alert(scope === 'all' ? t('settings.accessTokenClearedAll') : scope === 'database' ? t('settings.accessTokenClearedDatabase') : t('settings.accessTokenClearedSession'));
-      } else {
-        alert(t('settings.accessTokenDeleteFailed', { message: res.error?.message || t('common.failed') }));
-      }
-    } catch (error) {
-      console.error(error);
-      alert(extractApiErrorMessage(error, t('settings.accessTokenDeleteNetworkError')));
-    } finally {
-      setClearingAccessToken(false);
-    }
-  };
-
-  const handlePersistAccessTokenDotenv = async () => {
-    const trimmedAccessToken = settings.accessToken.trim();
-    if (!trimmedAccessToken) {
-      alert(t('settings.enterAccessTokenFirst'));
-      return;
-    }
-
-    setPersistingAccessTokenDotenv(true);
-    try {
-      const settingsRes = await Client.updateSettings({ accessToken: trimmedAccessToken });
-      if (!settingsRes.success || !settingsRes.data) {
-        alert(t('settings.saveProviderFirst', { message: settingsRes.error?.message || t('common.failed') }));
-        return;
-      }
-
-      syncFromResponse(settingsRes.data);
-      setStoredAccessToken(trimmedAccessToken);
-
-      const res = await Client.persistAccessTokenToDotenv({ accessToken: trimmedAccessToken });
-      if (res.success && res.data) {
-        syncFromResponse(res.data);
-        setStoredAccessToken(trimmedAccessToken);
-        alert(t('settings.accessTokenDotenvSaved'));
-      } else {
-        alert(t('settings.accessTokenDotenvFailed', { message: res.error?.message || t('common.failed') }));
-      }
-    } catch (error) {
-      console.error(error);
-      alert(extractApiErrorMessage(error, t('settings.accessTokenDotenvNetworkError')));
-    } finally {
-      setPersistingAccessTokenDotenv(false);
     }
   };
 
@@ -701,6 +675,8 @@ export default function Settings() {
 
       <SettingsSummaryCard title={t('settings.accessProtection')} icon={<ShieldCheck size={16} />}>
         <div>{t('settings.authRequired')}: {authRequired ? t('common.enabled') : t('common.disabled')}</div>
+        <div>{t('settings.adminAccount')}: {adminAuth?.configured ? (adminAuth.username || t('settings.notConfigured')) : t('settings.notConfigured')}</div>
+        <div>{t('settings.adminLockStatus')}: {adminAuth?.locked ? t('settings.adminLocked') : t('settings.adminUnlocked')}</div>
         <div>{accessTokenStatusText}{maskedAccessToken ? `, ${t('settings.currentMask')}: ${maskedAccessToken}` : ''}</div>
         <div>{t('settings.persistence')}: {accessTokenPersistenceText}</div>
         <div>{t('settings.storagePath')}: {accessTokenStorageLocation}</div>
@@ -916,57 +892,71 @@ export default function Settings() {
             <div style={overviewGridStyle}>
               <SettingsSummaryCard title={t('settings.accessProtection')} icon={<ShieldCheck size={16} />}>
                 <div>{t('settings.authRequired')}: {authRequired ? t('common.enabled') : t('common.disabled')}</div>
+                <div>{t('settings.adminAccount')}: {adminAuth?.configured ? (adminAuth.username || t('settings.notConfigured')) : t('settings.notConfigured')}</div>
+                <div>{t('settings.adminLockStatus')}: {adminAuth?.locked ? t('settings.adminLocked') : t('settings.adminUnlocked')}</div>
                 <div>{accessTokenStatusText}{maskedAccessToken ? `, ${t('settings.currentMask')}: ${maskedAccessToken}` : ''}</div>
                 <div>{t('settings.persistence')}: {accessTokenPersistenceText}</div>
                 <div>{t('settings.storagePath')}: {accessTokenStorageLocation}</div>
               </SettingsSummaryCard>
             </div>
             <SettingsSectionCard title={t('settings.section.security')} description={t('settings.section.securityHint')}>
-              <div>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('settings.accessToken')}</label>
-                <input
-                  type="password"
-                  className="glass-input"
-                  value={settings.accessToken}
-                  onChange={(event) => setSettings((current) => ({ ...current, accessToken: event.target.value }))}
-                  placeholder={hasAccessToken ? t('settings.keepCurrentAccessToken') : 'translator-access-token'}
-                />
-                <p style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '0.5rem', lineHeight: 1.7 }}>
-                  <AlertCircle size={14} />
-                  {t('settings.accessTokenHint')}
-                </p>
+              <div style={twoColumnGridStyle}>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('settings.adminUsername')}</label>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    value={accountForm.username}
+                    onChange={(event) => setAccountForm((current) => ({ ...current, username: event.target.value }))}
+                    placeholder="admin"
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('settings.currentPassword')}</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    value={accountForm.currentPassword}
+                    onChange={(event) => setAccountForm((current) => ({ ...current, currentPassword: event.target.value }))}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('settings.newPassword')}</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    value={accountForm.password}
+                    onChange={(event) => setAccountForm((current) => ({ ...current, password: event.target.value }))}
+                    placeholder={t('settings.keepCurrentPassword')}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600 }}>{t('settings.confirmNewPassword')}</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    value={accountForm.confirmPassword}
+                    onChange={(event) => setAccountForm((current) => ({ ...current, confirmPassword: event.target.value }))}
+                    placeholder={t('settings.keepCurrentPassword')}
+                  />
+                </div>
               </div>
+
+              <p style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '-0.35rem', lineHeight: 1.7 }}>
+                <AlertCircle size={14} />
+                {t('settings.adminAccountHint')}
+              </p>
 
               <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
                 <button
                   type="button"
                   className="glass-button primary"
-                  disabled={savingSection === 'security' || !settings.accessToken.trim()}
-                  onClick={() => void handleSaveSecurity()}
+                  disabled={savingAccount || !accountForm.username.trim() || !accountForm.currentPassword.trim()}
+                  onClick={() => void handleSaveAdminAccount()}
                   style={{ padding: '0.8rem 1.6rem' }}
                 >
                   <Save size={18} />
-                  {savingSection === 'security' ? t('settings.saving') : t('settings.saveSecurity')}
-                </button>
-                <button
-                  type="button"
-                  className="glass-button"
-                  disabled={persistingAccessTokenDotenv}
-                  onClick={() => void handlePersistAccessTokenDotenv()}
-                  style={{ padding: '0.8rem 1.6rem' }}
-                >
-                  <KeyRound size={18} />
-                  {persistingAccessTokenDotenv ? t('settings.writingDotenv') : t('settings.writeAccessTokenDotenv')}
-                </button>
-                <button
-                  type="button"
-                  className="glass-button"
-                  disabled={clearingAccessToken || !hasAccessToken}
-                  onClick={() => void handleClearAccessToken()}
-                  style={{ padding: '0.8rem 1.6rem' }}
-                >
-                  <Trash2 size={18} />
-                  {clearingAccessToken ? t('settings.clearingAccessToken') : t('settings.deleteAccessToken')}
+                  {savingAccount ? t('settings.saving') : t('settings.saveAdminAccount')}
                 </button>
               </div>
             </SettingsSectionCard>
