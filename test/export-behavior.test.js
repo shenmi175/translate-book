@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { mergeMarkdown } from '../server/lib/markdown.js';
+import { mergeMarkdown, parseMarkdownDocument } from '../server/lib/markdown.js';
 import { buildPdfExport } from '../server/lib/pdf-export.js';
 import {
   clearAllState,
@@ -82,6 +82,15 @@ test('translation-only markdown export uses a visible placeholder for unfinished
   ], 'target_only');
 
   assert.equal(output, '[TRANSLATION PENDING p-001 status=queued]');
+});
+
+test('markdown image blocks are skipped and preserved in target exports', () => {
+  const parsed = parseMarkdownDocument('![Chart](images/chart.png)\n\nReadable text');
+  const imageBlock = parsed.blocks.find((block) => block.type === 'image');
+
+  assert.equal(imageBlock?.shouldTranslate, false);
+  assert.match(imageBlock?.skipReason || '', /Images are preserved/);
+  assert.match(mergeMarkdown(parsed.blocks, 'target_only'), /!\[Chart\]\(images\/chart\.png\)/);
 });
 
 test('bilingual markdown export keeps the target side even when source and translation match', () => {

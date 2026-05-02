@@ -46,9 +46,13 @@ const LEGACY_JSON_STATE_PATH = CONFIGURED_STATE_PATH.endsWith(".json")
     : "";
 const configuredDotenvPath =
   typeof process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH === "string" ? process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH.trim() : "";
+const ROOT_DOTENV_PATH = path.join(ROOT_DIR, ".env");
+const RUNTIME_DOTENV_PATH = path.join(__dirname, "../data/runtime/.env");
 const DOTENV_PATH = configuredDotenvPath
   ? path.resolve(path.isAbsolute(configuredDotenvPath) ? configuredDotenvPath : path.join(ROOT_DIR, configuredDotenvPath))
-  : path.join(ROOT_DIR, ".env");
+  : RUNTIME_DOTENV_PATH;
+const DOTENV_COMPAT_PATHS = Array.from(new Set([ROOT_DOTENV_PATH].filter((candidate) => candidate !== DOTENV_PATH)));
+const DOTENV_READ_PATHS = Array.from(new Set([DOTENV_PATH, ...DOTENV_COMPAT_PATHS]));
 const DEFAULT_EXPORT_CACHE_DIR = path.join(__dirname, "../data/export-cache");
 const CONFIGURED_EXPORT_CACHE_DIR = process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR
   ? path.resolve(process.env.MARKDOWN_TRANSLATOR_EXPORT_CACHE_DIR)
@@ -646,12 +650,12 @@ function parseDotenvEntries(raw = "") {
     });
 }
 
-function readDotenvEntries() {
-  if (!fs.existsSync(DOTENV_PATH)) {
+function readDotenvEntries(filePath = DOTENV_PATH) {
+  if (!fs.existsSync(filePath)) {
     return [];
   }
 
-  return parseDotenvEntries(fs.readFileSync(DOTENV_PATH, "utf8"));
+  return parseDotenvEntries(fs.readFileSync(filePath, "utf8"));
 }
 
 function decodeDotenvValue(value = "") {
@@ -690,7 +694,7 @@ function encodeDotenvValue(value = "") {
   return JSON.stringify(normalized);
 }
 
-function writeDotenvEntries(entries) {
+function writeDotenvEntries(entries, filePath = DOTENV_PATH) {
   const lines = entries.map((entry) => {
     if (entry.type === "pair") {
       return `${entry.indent || ""}${entry.key}${entry.separator || "="}${entry.value || ""}`;
@@ -702,29 +706,45 @@ function writeDotenvEntries(entries) {
   if (content && !content.endsWith("\n")) {
     content += "\n";
   }
-  fs.mkdirSync(path.dirname(DOTENV_PATH), { recursive: true });
-  fs.writeFileSync(DOTENV_PATH, content, "utf8");
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, "utf8");
 }
 
-function getDotenvApiKey() {
-  const entries = readDotenvEntries();
-  for (const keyName of DOTENV_API_KEY_KEYS) {
-    const pair = entries.find((entry) => entry.type === "pair" && entry.key === keyName);
-    const value = pair ? decodeDotenvValue(pair.value) : "";
-    if (value) {
-      return {
-        value,
-        storageKey: keyName,
-        scope: "dotenv-file"
-      };
+function getDotenvSecret(secretKeys, paths = DOTENV_READ_PATHS) {
+  for (const filePath of paths) {
+    const entries = readDotenvEntries(filePath);
+    for (const keyName of secretKeys) {
+      const pair = entries.find((entry) => entry.type === "pair" && entry.key === keyName);
+      const value = pair ? decodeDotenvValue(pair.value) : "";
+      if (value) {
+        return {
+          value,
+          storageKey: keyName,
+          storagePath: filePath,
+          scope: "dotenv-file"
+        };
+      }
     }
   }
 
   return {
     value: "",
     storageKey: "",
+    storagePath: "",
     scope: "none"
   };
+}
+
+function getManagedDotenvApiKey() {
+  return getDotenvSecret(DOTENV_API_KEY_KEYS, [DOTENV_PATH]);
+}
+
+function getCompatibilityDotenvApiKey() {
+  return getDotenvSecret(DOTENV_API_KEY_KEYS, DOTENV_COMPAT_PATHS);
+}
+
+function getDotenvApiKey() {
+  return getDotenvSecret(DOTENV_API_KEY_KEYS);
 }
 
 function getProcessEnvApiKey() {
@@ -734,6 +754,7 @@ function getProcessEnvApiKey() {
       return {
         value,
         storageKey: keyName,
+        storagePath: "",
         scope: "environment"
       };
     }
@@ -742,29 +763,13 @@ function getProcessEnvApiKey() {
   return {
     value: "",
     storageKey: "",
+    storagePath: "",
     scope: "none"
   };
 }
 
 function getDotenvAccessToken() {
-  const entries = readDotenvEntries();
-  for (const keyName of DOTENV_ACCESS_TOKEN_KEYS) {
-    const pair = entries.find((entry) => entry.type === "pair" && entry.key === keyName);
-    const value = pair ? decodeDotenvValue(pair.value) : "";
-    if (value) {
-      return {
-        value,
-        storageKey: keyName,
-        scope: "dotenv-file"
-      };
-    }
-  }
-
-  return {
-    value: "",
-    storageKey: "",
-    scope: "none"
-  };
+  return getDotenvSecret(DOTENV_ACCESS_TOKEN_KEYS);
 }
 
 function getProcessEnvAccessToken() {
@@ -774,6 +779,7 @@ function getProcessEnvAccessToken() {
       return {
         value,
         storageKey: keyName,
+        storagePath: "",
         scope: "environment"
       };
     }
@@ -782,6 +788,7 @@ function getProcessEnvAccessToken() {
   return {
     value: "",
     storageKey: "",
+    storagePath: "",
     scope: "none"
   };
 }
@@ -858,16 +865,23 @@ function writeManagedAccessTokenToDotenv(accessToken) {
   writeDotenvEntries(nextEntries);
 }
 
+function clearDotenvSecrets(secretKeys, paths = DOTENV_READ_PATHS) {
+  for (const filePath of paths) {
+    if (!fs.existsSync(filePath)) {
+      continue;
+    }
+    const entries = readDotenvEntries(filePath);
+    const nextEntries = entries.filter((entry) => !(entry.type === "pair" && secretKeys.includes(entry.key)));
+    writeDotenvEntries(nextEntries, filePath);
+  }
+}
+
 function clearManagedApiKeyFromDotenv() {
-  const entries = readDotenvEntries();
-  const nextEntries = entries.filter((entry) => !(entry.type === "pair" && DOTENV_API_KEY_KEYS.includes(entry.key)));
-  writeDotenvEntries(nextEntries);
+  clearDotenvSecrets(DOTENV_API_KEY_KEYS);
 }
 
 function clearManagedAccessTokenFromDotenv() {
-  const entries = readDotenvEntries();
-  const nextEntries = entries.filter((entry) => !(entry.type === "pair" && DOTENV_ACCESS_TOKEN_KEYS.includes(entry.key)));
-  writeDotenvEntries(nextEntries);
+  clearDotenvSecrets(DOTENV_ACCESS_TOKEN_KEYS);
 }
 
 function normalizePersistedSecretValue(value = "") {
@@ -887,10 +901,15 @@ function activateManagedApiKeyForCurrentProcess(apiKey) {
   const normalized = normalizePersistedSecretValue(apiKey);
   if (normalized) {
     process.env[MANAGED_API_KEY_DOTENV_KEY] = normalized;
+    for (const legacyKey of LEGACY_API_KEY_DOTENV_KEYS) {
+      delete process.env[legacyKey];
+    }
     return;
   }
 
-  delete process.env[MANAGED_API_KEY_DOTENV_KEY];
+  for (const keyName of DOTENV_API_KEY_KEYS) {
+    delete process.env[keyName];
+  }
 }
 
 function persistApiKeyToPermanentEnv(apiKey) {
@@ -948,36 +967,36 @@ function persistMetadataSecret(upsertMeta, deleteMeta, key, value) {
 }
 
 function getResolvedApiKey() {
-  const processEnvSecret = getProcessEnvApiKey();
-  const dotenvSecret = getDotenvApiKey();
-  if (processEnvSecret.value) {
-    if (
-      dotenvSecret.value &&
-      processEnvSecret.storageKey === MANAGED_API_KEY_DOTENV_KEY &&
-      processEnvSecret.value === dotenvSecret.value
-    ) {
-      return {
-        value: dotenvSecret.value,
-        source: "dotenv",
-        storageKey: dotenvSecret.storageKey,
-        storageScope: dotenvSecret.scope || "dotenv-file"
-      };
-    }
+  const managedDotenvSecret = getManagedDotenvApiKey();
+  if (managedDotenvSecret.value) {
+    return {
+      value: managedDotenvSecret.value,
+      source: "dotenv",
+      storageKey: managedDotenvSecret.storageKey,
+      storagePath: managedDotenvSecret.storagePath,
+      storageScope: managedDotenvSecret.scope || "dotenv-file"
+    };
+  }
 
+  const processEnvSecret = getProcessEnvApiKey();
+  if (processEnvSecret.value) {
     return {
       value: processEnvSecret.value,
       source: "env",
       storageKey: processEnvSecret.storageKey,
+      storagePath: processEnvSecret.storagePath,
       storageScope: processEnvSecret.scope || "environment"
     };
   }
 
-  if (dotenvSecret.value) {
+  const compatibilityDotenvSecret = getCompatibilityDotenvApiKey();
+  if (compatibilityDotenvSecret.value) {
     return {
-      value: dotenvSecret.value,
+      value: compatibilityDotenvSecret.value,
       source: "dotenv",
-      storageKey: dotenvSecret.storageKey,
-      storageScope: dotenvSecret.scope || "dotenv-file"
+      storageKey: compatibilityDotenvSecret.storageKey,
+      storagePath: compatibilityDotenvSecret.storagePath,
+      storageScope: compatibilityDotenvSecret.scope || "dotenv-file"
     };
   }
 
@@ -987,6 +1006,7 @@ function getResolvedApiKey() {
       value: persistedValue,
       source: "database",
       storageKey: DB_PATH,
+      storagePath: DB_PATH,
       storageScope: "sqlite-db"
     };
   }
@@ -996,6 +1016,7 @@ function getResolvedApiKey() {
       value: runtimeSecrets.apiKey,
       source: "session",
       storageKey: "",
+      storagePath: "",
       storageScope: "memory-only"
     };
   }
@@ -1004,6 +1025,7 @@ function getResolvedApiKey() {
     value: "",
     source: "none",
     storageKey: "",
+    storagePath: "",
     storageScope: "none"
   };
 }
@@ -2370,7 +2392,7 @@ function sanitizeConfig(config) {
           : resolvedApiKey.source === "env"
             ? "environment"
             : "none";
-  next.apiKeyDotenvPath = DOTENV_PATH;
+  next.apiKeyDotenvPath = resolvedApiKey.source === "dotenv" && resolvedApiKey.storagePath ? resolvedApiKey.storagePath : DOTENV_PATH;
   next.hasAccessToken = Boolean(resolvedAccessToken.value);
   next.maskedAccessToken = maskSecret(resolvedAccessToken.value);
   next.accessTokenSource = resolvedAccessToken.source;
@@ -2444,7 +2466,7 @@ function buildTaskConfig(config = {}) {
           : resolvedAccessToken.source === "env"
             ? "environment"
             : "none";
-  merged.apiKeyDotenvPath = DOTENV_PATH;
+  merged.apiKeyDotenvPath = resolvedApiKey.source === "dotenv" && resolvedApiKey.storagePath ? resolvedApiKey.storagePath : DOTENV_PATH;
   merged.accessTokenDotenvPath = DOTENV_PATH;
   merged.stateStorePath = DB_PATH;
   merged.authRequired = Boolean(resolvedAccessToken.value);
@@ -2453,17 +2475,29 @@ function buildTaskConfig(config = {}) {
   return merged;
 }
 
-function getProviderSettings(task) {
+function getActiveApiKeyState() {
+  return getResolvedApiKey();
+}
+
+function buildProviderSettings(config = appSettings) {
   const resolvedApiKey = getResolvedApiKey();
+  const normalizedConfig = config || {};
 
   return {
-    apiProvider: task.config.apiProvider,
+    apiProvider: normalizedConfig.apiProvider,
     apiKey: resolvedApiKey.value,
-    apiBaseUrl: task.config.apiBaseUrl,
-    apiProtocol: normalizeApiProtocol(task.config.apiProtocol || appSettings.apiProtocol),
-    model: task.config.model,
-    requestTimeoutMs: task.config.requestTimeoutMs
+    apiKeySource: resolvedApiKey.source,
+    apiKeyStorageKey: resolvedApiKey.storageKey,
+    apiKeyStoragePath: resolvedApiKey.storagePath || "",
+    apiBaseUrl: normalizedConfig.apiBaseUrl,
+    apiProtocol: normalizeApiProtocol(normalizedConfig.apiProtocol || appSettings.apiProtocol),
+    model: normalizedConfig.model,
+    requestTimeoutMs: normalizedConfig.requestTimeoutMs || appSettings.requestTimeoutMs
   };
+}
+
+function getProviderSettings(task) {
+  return buildProviderSettings(task?.config || appSettings);
 }
 
 function mergeSettings(currentSettings, patch = {}) {
@@ -2984,7 +3018,7 @@ function assertTranslationReady(task) {
   const provider = getProviderSettings(task);
 
   if (!provider.apiKey) {
-    throw createError(409, "provider_not_configured", "API key is not configured.");
+    throw createError(409, "provider_not_configured", `API key is not configured. Checked managed .env (${DOTENV_PATH}), process environment, compatibility .env (${DOTENV_COMPAT_PATHS.join(", ") || "none"}), and legacy SQLite fallback.`);
   }
 
   if (!provider.model) {
@@ -3005,6 +3039,8 @@ function assertTranslationReady(task) {
       throw createError(409, "epub_reparse_required", "This EPUB task was parsed with an older block mapping format. Reparse or re-import the EPUB before translating.");
     }
   }
+
+  return provider;
 }
 
 function getTaskTimerBucket(taskId) {
@@ -3564,14 +3600,7 @@ export function getSettings() {
 
 export async function testProviderConnection() {
   const settings = getSettings();
-  const provider = {
-    apiProvider: settings.apiProvider,
-    apiKey: getResolvedApiKey().value,
-    apiBaseUrl: settings.apiBaseUrl,
-    apiProtocol: settings.apiProtocol,
-    model: settings.model,
-    requestTimeoutMs: appSettings.requestTimeoutMs
-  };
+  const provider = buildProviderSettings(appSettings);
 
   return {
     testedAt: now(),

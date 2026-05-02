@@ -50,13 +50,6 @@ export default function Dashboard() {
 
     setLoading(true);
     try {
-      const settings = await Client.getSettings();
-      if (!settings.success || !settings.data?.hasApiKey) {
-        alert(t('dashboard.noApiKey'));
-        navigate('/settings');
-        return;
-      }
-
       const createResponse =
         format === 'epub'
           ? await Client.createBinaryTask(uploadedFile!, {
@@ -77,6 +70,11 @@ export default function Dashboard() {
       const taskId = createResponse.data.id;
       const startResponse = await Client.startTranslation(taskId);
       if (!startResponse.success) {
+        if (startResponse.error?.code === 'provider_not_configured') {
+          alert(t('dashboard.noApiKey'));
+          navigate('/settings');
+          return;
+        }
         alert(startResponse.error?.message || t('dashboard.startTaskFailed'));
         navigate(`/tasks/${taskId}`);
         return;

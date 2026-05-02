@@ -235,9 +235,10 @@ npm install --prefix web
 
 项目支持以下 API Key 来源，优先级从高到低：
 
-1. 进程环境变量
-2. 本地 `.env`
-3. 旧版 SQLite Key 回退，启动后会自动迁移到 `.env` 并清理
+1. 运行时托管 `.env`，默认是 `server/data/runtime/.env`
+2. 进程环境变量
+3. 根目录 `.env` 兼容回退
+4. 旧版 SQLite Key 回退，启动后会自动迁移到托管 `.env` 并清理
 
 支持读取的环境变量名：
 
@@ -282,7 +283,7 @@ PORT=8787
 说明：
 
 - 通过设置页“保存引擎配置”写入的 API Key 会直接保存到 `.env` 并立即生效
-- Docker 模式默认把 `.env` 写到已挂载的 `./server/data/runtime/.env`，重建容器后仍然可用
+- Docker 模式默认把 `.env` 写到已挂载的 `./server/data/runtime/.env`，它的优先级高于宿主机根目录 `.env` 透传进容器的环境变量，避免 Web 设置页保存后又被旧配置覆盖
 - 访问令牌仍可保存在 SQLite；只有你显式点击“写入 .env”时才会同步到本地文件，且该操作仍限制为服务器本机请求
 
 ## 使用流程

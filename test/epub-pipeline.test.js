@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +63,115 @@ function breakFragmentStructure(fragment) {
     .replace(new RegExp(`<${escapedTag}(?=\\b)`, 'g'), `<${replacementTag}`)
     .replace(new RegExp(`</${escapedTag}>`, 'g'), `</${replacementTag}>`);
 }
+
+async function createTextHtmlSpineEpub(t) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'mts-text-html-epub-'));
+  const epubPath = path.join(tempDir, 'text-html-spine.epub');
+
+  t.after(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const script = String.raw`
+import sys
+import zipfile
+import base64
+
+epub_path = sys.argv[1]
+files = {
+  "META-INF/container.xml": """<?xml version="1.0" encoding="utf-8"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile media-type="application/oebps-package+xml" full-path="EPUB/content.opf"/>
+  </rootfiles>
+</container>
+""",
+  "EPUB/content.opf": """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">text-html-spine</dc:identifier>
+    <dc:title>Text HTML Spine Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item href="chapter.html" id="chapter_1" media-type="text/html"/>
+    <item href="images/pixel.png" id="image_1" media-type="image/png"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter_1"/>
+  </spine>
+</package>
+""",
+  "EPUB/chapter.html": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+  <head><title>Article</title></head>
+  <body>
+    <h1>Article headline</h1>
+    <img src="images/pixel.png" alt="Chart image"/>
+    <p>First paragraph for translation.</p>
+  </body>
+</html>
+""",
+}
+image_files = {
+  "EPUB/images/pixel.png": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+}
+
+with zipfile.ZipFile(epub_path, "w") as archive:
+  archive.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+  for name, content in files.items():
+    archive.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
+  for name, content in image_files.items():
+    archive.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
+`;
+
+  const result = spawnSync('python3', ['-c', script, epubPath], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return readFile(epubPath);
+}
+
+test('EPUB parser accepts XHTML spine files declared as text/html', async (t) => {
+  const contentBuffer = await createTextHtmlSpineEpub(t);
+  const taskId = randomUUID();
+  const parsed = await parseEpubArchive({
+    taskId,
+    contentBuffer
+  });
+
+  t.after(async () => {
+    await removeTaskArtifacts({ asset: parsed.asset });
+  });
+
+  const translatableText = parsed.blocks
+    .filter((block) => block.shouldTranslate)
+    .map((block) => block.sourceMarkdown)
+    .join('\n');
+
+  assert.equal(parsed.asset.spineCount, 1);
+  assert.ok(parsed.stats.translatableBlocks >= 2);
+  assert.equal(parsed.blocks.find((block) => block.type === 'image')?.shouldTranslate, false);
+  assert.match(translatableText, /Article headline/);
+  assert.match(translatableText, /First paragraph for translation/);
+
+  const artifact = await buildEpubExport({
+    id: taskId,
+    filename: 'text-html-spine.epub',
+    config: {
+      targetLanguage: 'Chinese'
+    },
+    asset: parsed.asset,
+    blocks: parsed.blocks
+  });
+  const outputPath = path.join(path.dirname(parsed.asset.taskDir), `${taskId}-image-preserve-check.epub`);
+  await fs.promises.writeFile(outputPath, Buffer.from(artifact.content, 'base64'));
+  t.after(async () => {
+    await rm(outputPath, { force: true });
+  });
+
+  const listing = spawnSync('unzip', ['-l', outputPath], { encoding: 'utf8' });
+  assert.equal(listing.status, 0, listing.stderr || listing.stdout);
+  assert.match(listing.stdout, /EPUB\/images\/pixel\.png/);
+});
 
 test('EPUB parse and export smoke test', async (t) => {
   if (!SAMPLE_EPUB_PATH) {

@@ -159,6 +159,16 @@ count_sqlite_table() {
   ' 2>/dev/null || printf '0'
 }
 
+count_task_asset_dirs() {
+  tasks_dir="${PROJECT_DIR}/server/data/tasks"
+  if [ ! -d "$tasks_dir" ]; then
+    printf '0'
+    return
+  fi
+
+  find "$tasks_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
 is_container_running() {
   run_docker ps \
     --filter "name=^/${SERVICE_NAME}$" \
@@ -169,6 +179,21 @@ is_container_running() {
 has_container_api_key() {
   is_container_running || return 1
   run_docker exec "$SERVICE_NAME" sh -lc 'test -s /app/server/data/runtime/.env && grep -Eq "^MARKDOWN_TRANSLATOR_API_KEY=.+$" /app/server/data/runtime/.env' >/dev/null 2>&1
+}
+
+has_host_api_key() {
+  env_path="${PROJECT_DIR}/server/data/runtime/.env"
+  if grep -Eq "^MARKDOWN_TRANSLATOR_API_KEY=.+$" "$env_path" >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n grep -Eq "^MARKDOWN_TRANSLATOR_API_KEY=.+$" "$env_path" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+has_api_key() {
+  has_container_api_key || has_host_api_key
 }
 
 clear_data() {
@@ -215,6 +240,36 @@ backup_data() {
 
   backup_dir="${data_dir}/backups/pre-rebuild-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$backup_dir"
+
+  if is_container_running; then
+    container_backup_dir="/app/server/data/backups/$(basename "$backup_dir")"
+    if run_docker exec -u node -e SQLITE_BACKUP_TARGET="${container_backup_dir}/app.sqlite" "$SERVICE_NAME" node --input-type=module -e '
+      import fs from "node:fs";
+      import path from "node:path";
+      import { DatabaseSync } from "node:sqlite";
+      const target = process.env.SQLITE_BACKUP_TARGET;
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.rmSync(target, { force: true });
+      const db = new DatabaseSync("/app/server/data/app.sqlite");
+      const quotedTarget = db.prepare("SELECT quote(?) AS value").get(target).value;
+      db.exec("VACUUM INTO " + quotedTarget);
+      db.close();
+    ' >/dev/null 2>&1; then
+      run_docker exec "$SERVICE_NAME" sh -lc "
+        mkdir -p '${container_backup_dir}/runtime'
+        for filename in runtime/.env runtime/access-token db.json; do
+          if [ -e \"/app/server/data/\${filename}\" ]; then
+            cp -p \"/app/server/data/\${filename}\" \"${container_backup_dir}/\${filename}\"
+          fi
+        done
+        chown -R node:node '${container_backup_dir}' 2>/dev/null || true
+      " >/dev/null 2>&1 || true
+      log "Backed up live SQLite snapshot to ${backup_dir}"
+      return
+    fi
+    log "Warning: live SQLite snapshot failed; falling back to file copy."
+  fi
+
   for filename in app.sqlite app.sqlite-wal app.sqlite-shm db.json runtime/.env runtime/access-token; do
     if path_exists_for_backup "${data_dir}/${filename}"; then
       copy_file_for_backup "${data_dir}/${filename}" "${backup_dir}/${filename}"
@@ -264,18 +319,23 @@ run_smoke_test() {
 cd "$PROJECT_DIR"
 
 PRE_TASK_COUNT="$(count_sqlite_table tasks)"
+PRE_TASK_ASSET_COUNT="$(count_task_asset_dirs)"
 PRE_HAS_API_KEY=0
-if has_container_api_key; then
+if has_api_key; then
   PRE_HAS_API_KEY=1
 fi
-log "Preflight: SQLite tasks=${PRE_TASK_COUNT}, API key=$([ "$PRE_HAS_API_KEY" -eq 1 ] && printf present || printf not-detected)"
+log "Preflight: SQLite tasks=${PRE_TASK_COUNT}, task assets=${PRE_TASK_ASSET_COUNT}, API key=$([ "$PRE_HAS_API_KEY" -eq 1 ] && printf present || printf not-detected)"
 
-log "Stopping existing container"
-run_compose down
+if [ "${RESET_DATA}" -eq 0 ] && [ "${PRE_TASK_COUNT:-0}" -eq 0 ] && [ "${PRE_TASK_ASSET_COUNT:-0}" -gt 0 ]; then
+  log "Warning: task source assets exist but SQLite has no task rows. If tasks disappeared, run ./scripts/restore-state-backup.sh --latest-nonempty."
+fi
 
 if [ "$BACKUP_DATA" -eq 1 ]; then
   backup_data
 fi
+
+log "Stopping existing container"
+run_compose down
 
 if [ "$RESET_DATA" -eq 1 ]; then
   clear_data

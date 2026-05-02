@@ -109,8 +109,13 @@ test('SQLite FTS search finds persisted block content after reload', async () =>
   }
 });
 
+<<<<<<< Updated upstream
 test('creating a task does not clear the configured API key', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'translate-book-api-key-task-'));
+=======
+test('API key settings use the managed dotenv path as the single active source', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'translate-book-api-key-'));
+>>>>>>> Stashed changes
   const dbPath = path.join(tempDir, 'state.sqlite');
   const dotenvPath = path.join(tempDir, 'runtime.env');
   const previousDbPath = process.env.MARKDOWN_TRANSLATOR_DB_PATH;
@@ -120,15 +125,23 @@ test('creating a task does not clear the configured API key', async () => {
   try {
     process.env.MARKDOWN_TRANSLATOR_DB_PATH = dbPath;
     process.env.MARKDOWN_TRANSLATOR_DOTENV_PATH = dotenvPath;
+<<<<<<< Updated upstream
     delete process.env.MARKDOWN_TRANSLATOR_API_KEY;
 
     const mod = await import(`${TASK_SERVICE_URL}?api-key-task=1`);
     mod.clearAllState();
     mod.updateSettings({
+=======
+    process.env.MARKDOWN_TRANSLATOR_API_KEY = 'old-process-env-key';
+
+    const mod1 = await import(`${TASK_SERVICE_URL}?api-key-line=1`);
+    mod1.updateSettings({
+>>>>>>> Stashed changes
       apiProvider: 'OpenAI-Compatible',
       apiBaseUrl: 'https://example.test/v1',
       apiProtocol: 'responses',
       model: 'gpt-5.4',
+<<<<<<< Updated upstream
       apiKey: 'task-safe-key'
     });
 
@@ -144,6 +157,24 @@ test('creating a task does not clear the configured API key', async () => {
     assert.equal(settingsAfterCreate.hasApiKey, true);
     assert.equal(settingsAfterCreate.apiKeySource, 'dotenv');
     assert.match(fs.readFileSync(dotenvPath, 'utf8'), /^MARKDOWN_TRANSLATOR_API_KEY=task-safe-key/m);
+=======
+      apiKey: 'new-managed-key'
+    });
+
+    assert.match(fs.readFileSync(dotenvPath, 'utf8'), /^MARKDOWN_TRANSLATOR_API_KEY=new-managed-key/m);
+    const settings1 = mod1.getSettings();
+    assert.equal(settings1.hasApiKey, true);
+    assert.equal(settings1.apiKeySource, 'dotenv');
+    assert.equal(settings1.apiKeyDotenvPath, dotenvPath);
+
+    process.env.MARKDOWN_TRANSLATOR_API_KEY = 'old-process-env-key';
+    const mod2 = await import(`${TASK_SERVICE_URL}?api-key-line=2`);
+    const settings2 = mod2.getSettings();
+
+    assert.equal(settings2.hasApiKey, true);
+    assert.equal(settings2.apiKeySource, 'dotenv');
+    assert.equal(settings2.apiKeyDotenvPath, dotenvPath);
+>>>>>>> Stashed changes
   } finally {
     if (previousDbPath === undefined) {
       delete process.env.MARKDOWN_TRANSLATOR_DB_PATH;

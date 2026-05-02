@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 EPUB_NS = "http://www.idpf.org/2007/ops"
+EPUB_CONTENT_DOCUMENT_MEDIA_TYPES = {"application/xhtml+xml", "text/html"}
 
 ET.register_namespace("", XHTML_NS)
 ET.register_namespace("epub", EPUB_NS)
@@ -91,6 +92,11 @@ def get_collection_count(value):
     if isinstance(value, (list, tuple, dict, set)):
         return len(value)
     return 1
+
+
+def is_epub_content_document_media_type(media_type):
+    normalized = str(media_type or "").split(";", 1)[0].strip().lower()
+    return normalized in EPUB_CONTENT_DOCUMENT_MEDIA_TYPES
 
 
 def structure_attribute_name(name):
@@ -576,10 +582,12 @@ def get_block_prefix(block_type):
 
 
 def should_translate(block_type):
-    return block_type in {"heading", "paragraph", "list_item", "blockquote", "table", "image"}
+    return block_type in {"heading", "paragraph", "list_item", "blockquote", "table"}
 
 
 def get_skip_reason(block_type, has_translatable_content):
+    if block_type == "image":
+        return "Images are preserved in EPUB exports and skipped by default."
     if block_type == "fenced_code":
         return "Code-like XHTML blocks are skipped by default."
     if block_type == "thematic_break":
@@ -702,7 +710,7 @@ def validate_extracted_epub(extracted_root):
         absolute_path = Path(spine_item["absolutePath"])
         if not absolute_path.exists():
             raise RuntimeError(f"EPUB spine content is missing: {spine_item['href']}")
-        if spine_item["mediaType"] == "application/xhtml+xml":
+        if is_epub_content_document_media_type(spine_item["mediaType"]):
             parse_xml_file(absolute_path)
     return state
 
@@ -899,7 +907,7 @@ def invoke_parse_mode(args):
     chapter_index = 0
 
     for spine_item in state["spine"]:
-        if spine_item["mediaType"] != "application/xhtml+xml":
+        if not is_epub_content_document_media_type(spine_item["mediaType"]):
             chapter_index += 1
             continue
 

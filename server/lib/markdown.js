@@ -71,7 +71,7 @@ const PREFIX_BY_TYPE = {
   frontmatter: "fm"
 };
 
-const TRANSLATABLE_TYPES = new Set(["heading", "paragraph", "list_item", "blockquote", "table", "image"]);
+const TRANSLATABLE_TYPES = new Set(["heading", "paragraph", "list_item", "blockquote", "table"]);
 const PARAGRAPH_LIKE_TYPES = new Set(["heading", "paragraph", "list_item", "blockquote"]);
 const COMPLETED_TRANSLATION_STATUSES = new Set(["translated", "edited", "retranslated"]);
 
@@ -180,6 +180,8 @@ function skipReasonFor(type) {
       return "Frontmatter is kept as-is by default.";
     case "html_block":
       return "Raw HTML-like blocks are skipped conservatively.";
+    case "image":
+      return "Images are preserved in exports and skipped by default.";
     default:
       return "";
   }

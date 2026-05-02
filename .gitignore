@@ -2,6 +2,7 @@
 web/node_modules/
 server/data/db.json
 server/data/app.sqlite*
+server/data/backups/
 server/data/runtime/
 server/data/tasks/
 server/data/export-cache/
@@ -13,3 +14,5 @@ dist/
 web/dist/
 __pycache__/
 *.pyc
+__*_astonly.*
+__*_tmp.*
